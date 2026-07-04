@@ -21,7 +21,14 @@ const LLM_BASE_URL =
   process.env.LLM_BASE_URL ??
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const LLM_MODEL = process.env.LLM_MODEL ?? "gemini-2.5-flash";
+const LLM_PRO_MODEL = process.env.LLM_PRO_MODEL ?? "gemini-2.5-pro";
 const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
+
+// Client sends an alias, never a raw model name. Unknown alias -> default.
+const MODEL_ALIASES: Record<string, string> = {
+  default: LLM_MODEL,
+  pro: LLM_PRO_MODEL,
+};
 
 // Compaction tuning:
 // COMPACT_TRIGGER: when this many messages sit outside the summary, compact.
@@ -108,6 +115,7 @@ interface ChatBody {
   conversationId?: string;
   messages?: ChatMessage[];
   system?: string;
+  model?: string; // alias: "default" | "pro"
 }
 
 interface MemoryFact {
@@ -132,10 +140,6 @@ function tsToMillis(v: unknown): number | null {
   return v instanceof Timestamp ? v.toMillis() : null;
 }
 
-/**
- * Load context for a conversation: rolling summary (if any) as a system
- * block, plus all messages after the summary watermark.
- */
 async function loadConversationContext(
   conversationId: string
 ): Promise<ConversationContext> {
@@ -202,6 +206,8 @@ function buildSystemPrompt(
 
 // ---------- LLM helpers ----------
 
+// Non-streaming utility calls (extraction, compaction) always use the
+// default/Flash model — Pro's small daily quota is reserved for chat.
 async function llmComplete(messages: ChatMessage[]): Promise<string> {
   const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
     method: "POST",
@@ -233,12 +239,6 @@ Write an updated summary that:
 
 Respond with ONLY the updated summary text.`;
 
-/**
- * If enough messages have accumulated past the summary watermark, fold the
- * oldest of them into the rolling summary. Runs after the reply is sent,
- * so it never adds user-facing latency. Failures are logged and harmless —
- * the next turn just retries.
- */
 async function maybeCompact(conversationId: string, log: any): Promise<void> {
   const convRef = conversations.doc(conversationId);
   const convSnap = await convRef.get();
@@ -253,7 +253,6 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
   const tailSnap = await tailQuery.get();
   if (tailSnap.size <= COMPACT_TRIGGER) return;
 
-  // Fold everything except the newest COMPACT_KEEP messages
   const toFold = tailSnap.docs.slice(0, tailSnap.size - COMPACT_KEEP);
   if (toFold.length === 0) return;
 
@@ -514,6 +513,9 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   const baseSystem =
     body.system ?? "You are a helpful personal assistant. Be concise and direct.";
 
+  // Resolve model alias -> real model name. Unknown/missing -> default.
+  const chatModel = MODEL_ALIASES[body.model ?? "default"] ?? LLM_MODEL;
+
   const facts = await loadActiveFacts();
 
   let providerMessages: ChatMessage[];
@@ -561,7 +563,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
       Authorization: `Bearer ${LLM_API_KEY}`,
     },
     body: JSON.stringify({
-      model: LLM_MODEL,
+      model: chatModel,
       messages: providerMessages,
       stream: true,
     }),
@@ -629,8 +631,6 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     });
     await convRef.update({ updatedAt: FieldValue.serverTimestamp() });
 
-    // Post-response compaction: user already has their reply; this is
-    // pure bookkeeping and never blocks the stream.
     try {
       await maybeCompact(conversationId, request.log);
     } catch (err) {
@@ -639,7 +639,13 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   }
 
   request.log.info(
-    { user: user.email, conversationId, facts: facts.length, chars: assistantText.length },
+    {
+      user: user.email,
+      conversationId,
+      model: chatModel,
+      facts: facts.length,
+      chars: assistantText.length,
+    },
     "chat completed"
   );
 });
