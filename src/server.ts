@@ -9,6 +9,8 @@ import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
+const FENCE_HINT = String.fromCharCode(96, 96, 96);
+
 const BOOTSTRAP_ADMINS = (
   process.env.BOOTSTRAP_ADMINS ??
   "jryan@charlestownehotels.com,john99ran@gmail.com"
