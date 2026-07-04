@@ -9,27 +9,32 @@ import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-const ALLOWED_EMAILS = new Set(
-  (process.env.ALLOWED_EMAILS ?? "jryan@charlestownehotels.com,john99ran@gmail.com")
-    .split(",")
-    .map((e) => e.trim().toLowerCase())
-);
+// Bootstrap admins: seeded into the Firestore allowlist on first boot.
+// After that, the allowlist is managed from the admin UI, not this var.
+const BOOTSTRAP_ADMINS = (
+  process.env.BOOTSTRAP_ADMINS ??
+  "jryan@charlestownehotels.com,john99ran@gmail.com"
+)
+  .split(",")
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+
+// Email whose pre-accounts data (docs with no uid) gets claimed.
+const LEGACY_OWNER_EMAIL = (process.env.LEGACY_OWNER_EMAIL ?? "john99ran@gmail.com")
+  .trim()
+  .toLowerCase();
 
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
 
-// ---- Provider configs ----
-// Default/fast lane: Gemini Flash (also used for extraction + compaction)
+// ---- Provider lanes ----
 const LLM_BASE_URL =
   process.env.LLM_BASE_URL ??
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const LLM_MODEL = process.env.LLM_MODEL ?? "gemini-2.5-flash";
 const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
 
-// Pro lane: OpenRouter free reasoning model by default.
-// If PRO_API_KEY is not set, the "pro" alias silently falls back to the
-// default lane so nothing breaks before you add the key.
-const PRO_BASE_URL = process.env.PRO_BASE_URL ?? "https://openrouter.ai/api/v1";
-const PRO_MODEL = process.env.PRO_MODEL ?? "deepseek/deepseek-r1:free";
+const PRO_BASE_URL = process.env.PRO_BASE_URL ?? "https://api.groq.com/openai/v1";
+const PRO_MODEL = process.env.PRO_MODEL ?? "openai/gpt-oss-120b";
 const PRO_API_KEY = process.env.PRO_API_KEY ?? "";
 
 interface ProviderConfig {
@@ -48,13 +53,11 @@ const PRO_PROVIDER: ProviderConfig = PRO_API_KEY
   ? { baseUrl: PRO_BASE_URL, apiKey: PRO_API_KEY, model: PRO_MODEL }
   : DEFAULT_PROVIDER;
 
-// Client sends an alias, never a raw model or URL. Unknown alias -> default.
 const MODEL_ALIASES: Record<string, ProviderConfig> = {
   default: DEFAULT_PROVIDER,
   pro: PRO_PROVIDER,
 };
 
-// Compaction tuning
 const COMPACT_TRIGGER = 50;
 const COMPACT_KEEP = 20;
 
@@ -90,11 +93,40 @@ await app.register(cors, {
   exposedHeaders: ["X-Conversation-Id"],
 });
 
+// ---------- Collections ----------
+
+const conversations = db.collection("conversations");
+const memory = db.collection("memory");
+const allowlist = db.collection("allowlist");
+
+// ---------- Allowlist bootstrap ----------
+// Seed bootstrap admins once, on startup. Idempotent.
+async function seedAllowlist(): Promise<void> {
+  for (const email of BOOTSTRAP_ADMINS) {
+    const ref = allowlist.doc(email);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      await ref.set({
+        email,
+        role: "admin",
+        addedAt: FieldValue.serverTimestamp(),
+        addedBy: "bootstrap",
+      });
+      console.log(`Seeded bootstrap admin: ${email}`);
+    } else if (snap.data()?.role !== "admin") {
+      // Ensure bootstrap emails are always admin
+      await ref.update({ role: "admin" });
+    }
+  }
+}
+await seedAllowlist();
+
 // ---------- Auth ----------
 
 interface AuthedUser {
   uid: string;
   email: string;
+  role: "admin" | "user";
 }
 
 async function requireAllowedUser(authHeader: string | undefined): Promise<AuthedUser> {
@@ -110,10 +142,17 @@ async function requireAllowedUser(authHeader: string | undefined): Promise<Authe
     });
 
   const email = decoded.email?.toLowerCase();
-  if (!email || !decoded.email_verified || !ALLOWED_EMAILS.has(email)) {
-    throw { statusCode: 403, message: "This account is not authorized" };
+  if (!email || !decoded.email_verified) {
+    throw { statusCode: 403, message: "Email not verified" };
   }
-  return { uid: decoded.uid, email };
+
+  const entry = await allowlist.doc(email).get();
+  if (!entry.exists) {
+    throw { statusCode: 403, message: "This account is not authorized. Ask an admin to add you." };
+  }
+
+  const role = (entry.data()?.role as "admin" | "user") ?? "user";
+  return { uid: decoded.uid, email, role };
 }
 
 async function guard(request: any, reply: any): Promise<AuthedUser | null> {
@@ -123,6 +162,34 @@ async function guard(request: any, reply: any): Promise<AuthedUser | null> {
     reply.code(err.statusCode ?? 401).send({ error: err.message });
     return null;
   }
+}
+
+async function guardAdmin(request: any, reply: any): Promise<AuthedUser | null> {
+  const user = await guard(request, reply);
+  if (!user) return null;
+  if (user.role !== "admin") {
+    reply.code(403).send({ error: "Admin access required" });
+    return null;
+  }
+  return user;
+}
+
+// ---------- Ownership helpers ----------
+
+/**
+ * Returns true if this user may access this doc. A doc with no uid is
+ * legacy data, owned by LEGACY_OWNER_EMAIL. On first access by that owner,
+ * the doc is claimed (uid stamped in) so it stops being ambiguous.
+ */
+function ownsDoc(
+  user: AuthedUser,
+  data: FirebaseFirestore.DocumentData | undefined
+): boolean {
+  if (!data) return false;
+  const docUid = data.uid as string | undefined;
+  if (docUid) return docUid === user.uid;
+  // Legacy doc (no uid): belongs to the legacy owner
+  return user.email === LEGACY_OWNER_EMAIL;
 }
 
 // ---------- Types ----------
@@ -137,7 +204,7 @@ interface ChatBody {
   conversationId?: string;
   messages?: ChatMessage[];
   system?: string;
-  model?: string; // alias: "default" | "pro"
+  model?: string;
 }
 
 interface MemoryFact {
@@ -154,9 +221,6 @@ interface ConversationContext {
 }
 
 // ---------- Firestore helpers ----------
-
-const conversations = db.collection("conversations");
-const memory = db.collection("memory");
 
 function tsToMillis(v: unknown): number | null {
   return v instanceof Timestamp ? v.toMillis() : null;
@@ -194,15 +258,18 @@ async function loadConversationContext(
   return { systemBlocks, history };
 }
 
-async function loadActiveFacts(): Promise<MemoryFact[]> {
+// Memory is now per-user. Legacy facts (no uid) count for the legacy owner.
+async function loadActiveFacts(user: AuthedUser): Promise<MemoryFact[]> {
   const snap = await memory.where("active", "==", true).get();
-  const facts = snap.docs.map((d) => ({
-    id: d.id,
-    text: String(d.data().text ?? ""),
-    active: true,
-    createdAt: tsToMillis(d.data().createdAt),
-    sourceConversationId: d.data().sourceConversationId ?? null,
-  }));
+  const facts = snap.docs
+    .filter((d) => ownsDoc(user, d.data()))
+    .map((d) => ({
+      id: d.id,
+      text: String(d.data().text ?? ""),
+      active: true,
+      createdAt: tsToMillis(d.data().createdAt),
+      sourceConversationId: d.data().sourceConversationId ?? null,
+    }));
   facts.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
   return facts;
 }
@@ -233,15 +300,12 @@ function providerHeaders(provider: ProviderConfig): Record<string, string> {
     "Content-Type": "application/json",
     Authorization: `Bearer ${provider.apiKey}`,
   };
-  // OpenRouter attribution headers (optional but recommended by them)
   if (provider.baseUrl.includes("openrouter.ai")) {
     headers["X-Title"] = "Personal AI Chat";
   }
   return headers;
 }
 
-// Non-streaming utility calls (extraction, compaction) always use the
-// default/Flash lane — reasoning-model quota is reserved for chat.
 async function llmComplete(messages: ChatMessage[]): Promise<string> {
   const res = await fetch(`${DEFAULT_PROVIDER.baseUrl}/chat/completions`, {
     method: "POST",
@@ -310,26 +374,93 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
     summaryUpTo: lastFolded.data().createdAt,
   });
 
-  log.info(
-    { conversationId, folded: toFold.length, kept: COMPACT_KEEP },
-    "conversation compacted"
-  );
+  log.info({ conversationId, folded: toFold.length }, "conversation compacted");
 }
 
-// ---------- Routes: conversations ----------
+// ---------- Route: health & me ----------
 
 app.get("/api/health", async () => ({ ok: true }));
+
+app.get("/api/me", async (request, reply) => {
+  const user = await guard(request, reply);
+  if (!user) return;
+  return { email: user.email, role: user.role };
+});
+
+// ---------- Routes: allowlist (admin only) ----------
+
+app.get("/api/allowlist", async (request, reply) => {
+  const user = await guardAdmin(request, reply);
+  if (!user) return;
+
+  const snap = await allowlist.orderBy("addedAt", "desc").get();
+  return snap.docs.map((d) => ({
+    email: d.id,
+    role: d.data().role ?? "user",
+    addedAt: tsToMillis(d.data().addedAt),
+  }));
+});
+
+app.post<{ Body: { email?: string; role?: string } }>(
+  "/api/allowlist",
+  async (request, reply) => {
+    const user = await guardAdmin(request, reply);
+    if (!user) return;
+
+    const email = request.body?.email?.trim().toLowerCase();
+    const role = request.body?.role === "admin" ? "admin" : "user";
+    if (!email || !email.includes("@")) {
+      return reply.code(400).send({ error: "Valid email required" });
+    }
+
+    await allowlist.doc(email).set({
+      email,
+      role,
+      addedAt: FieldValue.serverTimestamp(),
+      addedBy: user.email,
+    });
+    return { ok: true };
+  }
+);
+
+app.delete<{ Params: { email: string } }>(
+  "/api/allowlist/:email",
+  async (request, reply) => {
+    const user = await guardAdmin(request, reply);
+    if (!user) return;
+
+    const target = decodeURIComponent(request.params.email).toLowerCase();
+    if (target === user.email) {
+      return reply.code(400).send({ error: "You cannot remove yourself" });
+    }
+    await allowlist.doc(target).delete();
+    return { ok: true };
+  }
+);
+
+// ---------- Routes: conversations ----------
 
 app.get("/api/conversations", async (request, reply) => {
   const user = await guard(request, reply);
   if (!user) return;
 
-  const snap = await conversations.orderBy("updatedAt", "desc").limit(50).get();
-  return snap.docs.map((d) => ({
-    id: d.id,
-    title: d.data().title ?? "Untitled",
-    updatedAt: tsToMillis(d.data().updatedAt),
-  }));
+  // Fetch recent, filter to this user (incl. legacy), pins first.
+  const snap = await conversations.orderBy("updatedAt", "desc").limit(200).get();
+  const mine = snap.docs
+    .filter((d) => ownsDoc(user, d.data()))
+    .map((d) => ({
+      id: d.id,
+      title: d.data().title ?? "Untitled",
+      updatedAt: tsToMillis(d.data().updatedAt),
+      pinned: d.data().pinned === true,
+    }));
+
+  mine.sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  });
+
+  return mine.slice(0, 50);
 });
 
 app.get<{ Params: { id: string } }>(
@@ -338,17 +469,43 @@ app.get<{ Params: { id: string } }>(
     const user = await guard(request, reply);
     if (!user) return;
 
-    const snap = await conversations
-      .doc(request.params.id)
-      .collection("messages")
-      .orderBy("createdAt", "asc")
-      .get();
+    const convRef = conversations.doc(request.params.id);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+      return reply.code(404).send({ error: "Not found" });
+    }
 
+    const snap = await convRef.collection("messages").orderBy("createdAt", "asc").get();
     return snap.docs.map((d) => ({
       role: d.data().role,
       content: d.data().content,
       createdAt: tsToMillis(d.data().createdAt),
     }));
+  }
+);
+
+app.patch<{ Params: { id: string }; Body: { pinned?: boolean } }>(
+  "/api/conversations/:id",
+  async (request, reply) => {
+    const user = await guard(request, reply);
+    if (!user) return;
+
+    const convRef = conversations.doc(request.params.id);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+      return reply.code(404).send({ error: "Not found" });
+    }
+
+    const updates: Record<string, unknown> = {};
+    if (typeof request.body?.pinned === "boolean") updates.pinned = request.body.pinned;
+    // Claim legacy docs on write
+    if (!convSnap.data()?.uid) updates.uid = user.uid;
+
+    if (Object.keys(updates).length === 0) {
+      return reply.code(400).send({ error: "Nothing to update" });
+    }
+    await convRef.update(updates);
+    return { ok: true };
   }
 );
 
@@ -358,25 +515,34 @@ app.delete<{ Params: { id: string } }>(
     const user = await guard(request, reply);
     if (!user) return;
 
-    await db.recursiveDelete(conversations.doc(request.params.id));
+    const convRef = conversations.doc(request.params.id);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+      return reply.code(404).send({ error: "Not found" });
+    }
+
+    await db.recursiveDelete(convRef);
     return { ok: true };
   }
 );
 
-// ---------- Routes: memory CRUD ----------
+// ---------- Routes: memory ----------
 
 app.get("/api/memory", async (request, reply) => {
   const user = await guard(request, reply);
   if (!user) return;
 
-  const snap = await memory.orderBy("createdAt", "desc").limit(500).get();
-  return snap.docs.map((d) => ({
-    id: d.id,
-    text: d.data().text ?? "",
-    active: d.data().active !== false,
-    createdAt: tsToMillis(d.data().createdAt),
-    sourceConversationId: d.data().sourceConversationId ?? null,
-  }));
+  const snap = await memory.orderBy("createdAt", "desc").limit(1000).get();
+  return snap.docs
+    .filter((d) => ownsDoc(user, d.data()))
+    .map((d) => ({
+      id: d.id,
+      text: d.data().text ?? "",
+      active: d.data().active !== false,
+      createdAt: tsToMillis(d.data().createdAt),
+      sourceConversationId: d.data().sourceConversationId ?? null,
+    }))
+    .slice(0, 500);
 });
 
 app.post<{ Body: { text?: string } }>("/api/memory", async (request, reply) => {
@@ -387,6 +553,7 @@ app.post<{ Body: { text?: string } }>("/api/memory", async (request, reply) => {
   if (!text) return reply.code(400).send({ error: "text required" });
 
   const doc = await memory.add({
+    uid: user.uid,
     text,
     active: true,
     createdAt: FieldValue.serverTimestamp(),
@@ -401,6 +568,12 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
     const user = await guard(request, reply);
     if (!user) return;
 
+    const ref = memory.doc(request.params.id);
+    const snap = await ref.get();
+    if (!snap.exists || !ownsDoc(user, snap.data())) {
+      return reply.code(404).send({ error: "Not found" });
+    }
+
     const updates: Record<string, unknown> = {};
     if (typeof request.body?.text === "string" && request.body.text.trim()) {
       updates.text = request.body.text.trim();
@@ -408,16 +581,17 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
     if (typeof request.body?.active === "boolean") {
       updates.active = request.body.active;
     }
+    if (!snap.data()?.uid) updates.uid = user.uid; // claim legacy
     if (Object.keys(updates).length === 0) {
       return reply.code(400).send({ error: "Nothing to update" });
     }
 
-    await memory.doc(request.params.id).update(updates);
+    await ref.update(updates);
     return { ok: true };
   }
 );
 
-// ---------- Route: extraction ("Remember this conversation") ----------
+// ---------- Route: extraction ----------
 
 const EXTRACTION_INSTRUCTIONS = `You maintain a long-term memory of durable facts about the user.
 
@@ -457,13 +631,13 @@ app.post<{ Params: { id: string } }>(
     if (!user) return;
 
     const conversationId = request.params.id;
+    const convRef = conversations.doc(conversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+      return reply.code(404).send({ error: "Not found" });
+    }
 
-    const msgSnap = await conversations
-      .doc(conversationId)
-      .collection("messages")
-      .orderBy("createdAt", "asc")
-      .get();
-
+    const msgSnap = await convRef.collection("messages").orderBy("createdAt", "asc").get();
     if (msgSnap.empty) {
       return reply.code(400).send({ error: "Conversation has no messages" });
     }
@@ -472,7 +646,7 @@ app.post<{ Params: { id: string } }>(
       .map((d) => `${d.data().role === "user" ? "User" : "Assistant"}: ${d.data().content}`)
       .join("\n");
 
-    const existing = await loadActiveFacts();
+    const existing = await loadActiveFacts(user);
     const existingBlock =
       existing.length > 0
         ? existing.map((f) => `[${f.id}] ${f.text}`).join("\n")
@@ -491,7 +665,6 @@ app.post<{ Params: { id: string } }>(
       try {
         const raw = await llmComplete(extractionMessages);
         result = parseExtraction(raw);
-        if (!result) request.log.warn({ attempt, raw: raw.slice(0, 200) }, "extraction parse failed");
       } catch (err) {
         request.log.error(err, "extraction call failed");
       }
@@ -513,6 +686,7 @@ app.post<{ Params: { id: string } }>(
 
     for (const text of result.new_facts) {
       batch.set(memory.doc(), {
+        uid: user.uid,
         text: text.trim(),
         active: true,
         createdAt: FieldValue.serverTimestamp(),
@@ -521,16 +695,7 @@ app.post<{ Params: { id: string } }>(
     }
 
     await batch.commit();
-
-    request.log.info(
-      { user: user.email, added: result.new_facts.length, deactivated },
-      "memory extraction applied"
-    );
-
-    return {
-      added: result.new_facts,
-      deactivated,
-    };
+    return { added: result.new_facts, deactivated };
   }
 );
 
@@ -543,11 +708,9 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   const body = request.body ?? {};
   const baseSystem =
     body.system ?? "You are a helpful personal assistant. Be concise and direct.";
-
-  // Resolve alias -> provider config. Unknown/missing -> default lane.
   const provider = MODEL_ALIASES[body.model ?? "default"] ?? DEFAULT_PROVIDER;
 
-  const facts = await loadActiveFacts();
+  const facts = await loadActiveFacts(user);
 
   let providerMessages: ChatMessage[];
   let conversationId: string | null = null;
@@ -556,10 +719,19 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     const userText = body.message.trim();
 
     if (body.conversationId) {
+      const convRef = conversations.doc(body.conversationId);
+      const convSnap = await convRef.get();
+      if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+        return reply.code(404).send({ error: "Conversation not found" });
+      }
       conversationId = body.conversationId;
+      // Claim legacy conversation on continued use
+      if (!convSnap.data()?.uid) await convRef.update({ uid: user.uid });
     } else {
       const doc = await conversations.add({
+        uid: user.uid,
         title: userText.slice(0, 60),
+        pinned: false,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -567,7 +739,6 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     }
 
     const convRef = conversations.doc(conversationId);
-
     await convRef.collection("messages").add({
       role: "user",
       content: userText,
@@ -599,10 +770,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
 
   if (!upstream.ok || !upstream.body) {
     const detail = await upstream.text().catch(() => "");
-    request.log.error(
-      { status: upstream.status, model: provider.model, detail },
-      "LLM provider error"
-    );
+    request.log.error({ status: upstream.status, model: provider.model, detail }, "LLM provider error");
     const friendly =
       upstream.status === 429
         ? "Model rate limit or daily quota hit. If you were using Pro, switch back to fast."
@@ -630,7 +798,6 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       reply.raw.write(value);
 
       lineBuffer += decoder.decode(value, { stream: true });
@@ -674,13 +841,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   }
 
   request.log.info(
-    {
-      user: user.email,
-      conversationId,
-      model: provider.model,
-      facts: facts.length,
-      chars: assistantText.length,
-    },
+    { user: user.email, conversationId, model: provider.model },
     "chat completed"
   );
 });
