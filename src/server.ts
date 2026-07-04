@@ -9,8 +9,6 @@ import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-const FENCE_HINT = String.fromCharCode(96, 96, 96);
-
 const BOOTSTRAP_ADMINS = (
   process.env.BOOTSTRAP_ADMINS ??
   "jryan@charlestownehotels.com,john99ran@gmail.com"
@@ -35,12 +33,16 @@ const PRO_BASE_URL = process.env.PRO_BASE_URL ?? "https://api.groq.com/openai/v1
 const PRO_MODEL = process.env.PRO_MODEL ?? "openai/gpt-oss-120b";
 const PRO_API_KEY = process.env.PRO_API_KEY ?? "";
 
+// Web search (Tavily). If unset, the search tool is not offered at all.
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? "";
 const MAX_SEARCH_ROUNDS = 3;
 
-// Max accepted image payload (base64 data URL). Firestore docs cap at 1MB;
-// this leaves headroom for the rest of the message document.
+// Max accepted image payload (base64 data URL). Firestore docs cap at 1MB.
 const MAX_IMAGE_BYTES = 900_000;
+
+// Code-fence marker (three backticks), built dynamically so this source file
+// never contains literal backticks (they corrupt when shared via markdown).
+const FENCE_HINT = String.fromCharCode(96, 96, 96);
 
 interface ProviderConfig {
   baseUrl: string;
@@ -120,7 +122,7 @@ async function seedAllowlist(): Promise<void> {
         addedAt: FieldValue.serverTimestamp(),
         addedBy: "bootstrap",
       });
-      console.log(`Seeded bootstrap admin: ${email}`);
+      console.log("Seeded bootstrap admin: " + email);
     } else if (snap.data()?.role !== "admin") {
       await ref.update({ role: "admin" });
     }
@@ -287,7 +289,8 @@ async function loadConversationContext(
   const systemBlocks: string[] = [];
   if (summary) {
     systemBlocks.push(
-      `Summary of the earlier part of this conversation (older messages have been condensed):\n${summary}`
+      "Summary of the earlier part of this conversation (older messages have been condensed):\n" +
+        summary
     );
   }
 
@@ -318,18 +321,27 @@ function buildSystemPrompt(
 
   if (TAVILY_API_KEY) {
     parts.push(
-      `You have a web_search tool. Use it when the question involves current events, ` +
-        `recent information, prices, weather, news, or anything you are unsure is up to date. ` +
-        `Do not use it for stable knowledge, personal conversation, or things already in context. ` +
-        `When you use search results, mention your sources briefly.`
+      "You have a web_search tool. Use it when the question involves current events, " +
+        "recent information, prices, weather, news, or anything you are unsure is up to date. " +
+        "Do not use it for stable knowledge, personal conversation, or things already in context. " +
+        "When you use search results, mention your sources briefly."
     );
   }
 
+  parts.push(
+    "When the user asks for an interactive demo, game, or runnable code, produce one complete, " +
+      "self-contained HTML file in a single " + FENCE_HINT + "html code block (inline CSS and JS, no external files). " +
+      "Make it work on BOTH desktop and mobile: support touch events (touchstart/touchmove) alongside mouse events, " +
+      "size the canvas responsively to the container (window.innerWidth/innerHeight, handle resize), " +
+      "and use large touch-friendly controls. The user runs it directly in a sandboxed iframe."
+  );
+
   if (facts.length > 0) {
-    const factLines = facts.map((f) => `- ${f.text}`).join("\n");
+    const factLines = facts.map((f) => "- " + f.text).join("\n");
     parts.push(
-      `You have persistent memory of the user from previous conversations. ` +
-        `Use these facts naturally when relevant; do not recite them unprompted:\n${factLines}`
+      "You have persistent memory of the user from previous conversations. " +
+        "Use these facts naturally when relevant; do not recite them unprompted:\n" +
+        factLines
     );
   }
 
@@ -342,7 +354,7 @@ function buildSystemPrompt(
 function providerHeaders(provider: ProviderConfig): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${provider.apiKey}`,
+    Authorization: "Bearer " + provider.apiKey,
   };
   if (provider.baseUrl.includes("openrouter.ai")) {
     headers["X-Title"] = "Personal AI Chat";
@@ -351,14 +363,14 @@ function providerHeaders(provider: ProviderConfig): Record<string, string> {
 }
 
 async function llmComplete(messages: ChatMessage[]): Promise<string> {
-  const res = await fetch(`${DEFAULT_PROVIDER.baseUrl}/chat/completions`, {
+  const res = await fetch(DEFAULT_PROVIDER.baseUrl + "/chat/completions", {
     method: "POST",
     headers: providerHeaders(DEFAULT_PROVIDER),
     body: JSON.stringify({ model: DEFAULT_PROVIDER.model, messages, stream: false }),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
-    throw new Error(`LLM error ${res.status}: ${detail.slice(0, 300)}`);
+    throw new Error("LLM error " + res.status + ": " + detail.slice(0, 300));
   }
   const json = await res.json();
   return String(json.choices?.[0]?.message?.content ?? "");
@@ -395,7 +407,7 @@ async function tavilySearch(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${TAVILY_API_KEY}`,
+        Authorization: "Bearer " + TAVILY_API_KEY,
       },
       body: JSON.stringify({
         query,
@@ -409,7 +421,10 @@ async function tavilySearch(
       const detail = await res.text().catch(() => "");
       log.error({ status: res.status, detail: detail.slice(0, 200) }, "Tavily error");
       return {
-        text: `Search failed (${res.status}). Answer from your own knowledge and say you could not verify current information.`,
+        text:
+          "Search failed (" +
+          res.status +
+          "). Answer from your own knowledge and say you could not verify current information.",
         sources: [],
       };
     }
@@ -418,9 +433,11 @@ async function tavilySearch(
     const parts: string[] = [];
     const sources: SearchSource[] = [];
 
-    if (json.answer) parts.push(`Summary: ${json.answer}`);
+    if (json.answer) parts.push("Summary: " + json.answer);
     for (const r of json.results ?? []) {
-      parts.push(`- ${r.title} (${r.url})\n  ${String(r.content ?? "").slice(0, 400)}`);
+      parts.push(
+        "- " + r.title + " (" + r.url + ")\n  " + String(r.content ?? "").slice(0, 400)
+      );
       if (r.url) sources.push({ title: String(r.title ?? r.url), url: String(r.url) });
     }
 
@@ -439,17 +456,15 @@ async function tavilySearch(
 
 // ---------- Compaction ----------
 
-const COMPACTION_INSTRUCTIONS = `You maintain a rolling summary of a conversation between a user and an assistant.
-
-You will receive the PREVIOUS SUMMARY (possibly empty) and a batch of OLDER MESSAGES that must now be folded into it.
-
-Write an updated summary that:
-- Preserves facts, decisions, preferences, open questions, and anything either party may refer back to later
-- Preserves specific names, numbers, code identifiers, and URLs mentioned
-- Drops pleasantries and redundancy
-- Is written in compact plain prose, at most ~400 words
-
-Respond with ONLY the updated summary text.`;
+const COMPACTION_INSTRUCTIONS =
+  "You maintain a rolling summary of a conversation between a user and an assistant.\n\n" +
+  "You will receive the PREVIOUS SUMMARY (possibly empty) and a batch of OLDER MESSAGES that must now be folded into it.\n\n" +
+  "Write an updated summary that:\n" +
+  "- Preserves facts, decisions, preferences, open questions, and anything either party may refer back to later\n" +
+  "- Preserves specific names, numbers, code identifiers, and URLs mentioned\n" +
+  "- Drops pleasantries and redundancy\n" +
+  "- Is written in compact plain prose, at most ~400 words\n\n" +
+  "Respond with ONLY the updated summary text.";
 
 async function maybeCompact(conversationId: string, log: any): Promise<void> {
   const convRef = conversations.doc(conversationId);
@@ -472,7 +487,7 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
     .map((d) => {
       const who = d.data().role === "user" ? "User" : "Assistant";
       const img = d.data().image ? " [image attached]" : "";
-      return `${who}:${img} ${d.data().content}`;
+      return who + ":" + img + " " + d.data().content;
     })
     .join("\n");
 
@@ -480,7 +495,11 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
     { role: "system", content: COMPACTION_INSTRUCTIONS },
     {
       role: "user",
-      content: `PREVIOUS SUMMARY:\n${prevSummary || "(empty)"}\n\nOLDER MESSAGES:\n${batchText}`,
+      content:
+        "PREVIOUS SUMMARY:\n" +
+        (prevSummary || "(empty)") +
+        "\n\nOLDER MESSAGES:\n" +
+        batchText,
     },
   ]);
 
@@ -716,17 +735,16 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
 
 // ---------- Route: extraction ----------
 
-const EXTRACTION_INSTRUCTIONS = `You maintain a long-term memory of durable facts about the user.
-
-Given the conversation transcript and the list of EXISTING facts, respond with ONLY a JSON object, no markdown fences, in exactly this shape:
-{"new_facts": ["..."], "deactivate_ids": ["..."]}
-
-Rules:
-- new_facts: durable facts about the user worth remembering across future conversations (preferences, projects, people, decisions, circumstances). Write each as one short standalone sentence about "the user".
-- Do NOT include facts already covered by an existing fact.
-- Do NOT include trivia, small talk, or one-off details with no future value.
-- deactivate_ids: IDs of existing facts that this conversation shows are now false, outdated, or superseded.
-- If nothing qualifies, return {"new_facts": [], "deactivate_ids": []}.`;
+const EXTRACTION_INSTRUCTIONS =
+  "You maintain a long-term memory of durable facts about the user.\n\n" +
+  "Given the conversation transcript and the list of EXISTING facts, respond with ONLY a JSON object, no markdown fences, in exactly this shape:\n" +
+  '{"new_facts": ["..."], "deactivate_ids": ["..."]}\n\n' +
+  "Rules:\n" +
+  '- new_facts: durable facts about the user worth remembering across future conversations (preferences, projects, people, decisions, circumstances). Write each as one short standalone sentence about "the user".\n' +
+  "- Do NOT include facts already covered by an existing fact.\n" +
+  "- Do NOT include trivia, small talk, or one-off details with no future value.\n" +
+  "- deactivate_ids: IDs of existing facts that this conversation shows are now false, outdated, or superseded.\n" +
+  '- If nothing qualifies, return {"new_facts": [], "deactivate_ids": []}.';
 
 interface ExtractionResult {
   new_facts: string[];
@@ -734,7 +752,10 @@ interface ExtractionResult {
 }
 
 function parseExtraction(raw: string): ExtractionResult | null {
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
   try {
     const json = JSON.parse(cleaned);
     if (!Array.isArray(json.new_facts) || !Array.isArray(json.deactivate_ids)) return null;
@@ -769,21 +790,21 @@ app.post<{ Params: { id: string } }>(
       .map((d) => {
         const who = d.data().role === "user" ? "User" : "Assistant";
         const img = d.data().image ? " [image attached]" : "";
-        return `${who}:${img} ${d.data().content}`;
+        return who + ":" + img + " " + d.data().content;
       })
       .join("\n");
 
     const existing = await loadActiveFacts(user);
     const existingBlock =
       existing.length > 0
-        ? existing.map((f) => `[${f.id}] ${f.text}`).join("\n")
+        ? existing.map((f) => "[" + f.id + "] " + f.text).join("\n")
         : "(none)";
 
     const extractionMessages: ChatMessage[] = [
       { role: "system", content: EXTRACTION_INSTRUCTIONS },
       {
         role: "user",
-        content: `EXISTING FACTS:\n${existingBlock}\n\nTRANSCRIPT:\n${transcript}`,
+        content: "EXISTING FACTS:\n" + existingBlock + "\n\nTRANSCRIPT:\n" + transcript,
       },
     ];
 
@@ -848,7 +869,7 @@ async function streamOneRound(
   };
   if (offerTools) body.tools = [SEARCH_TOOL];
 
-  const upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
+  const upstream = await fetch(provider.baseUrl + "/chat/completions", {
     method: "POST",
     headers: providerHeaders(provider),
     body: JSON.stringify(body),
@@ -894,7 +915,7 @@ async function streamOneRound(
           for (const tc of delta.tool_calls) {
             const idx = tc.index ?? 0;
             if (!toolCalls[idx]) {
-              toolCalls[idx] = { id: tc.id ?? `call_${idx}`, name: "", arguments: "" };
+              toolCalls[idx] = { id: tc.id ?? "call_" + idx, name: "", arguments: "" };
             }
             if (tc.id) toolCalls[idx].id = tc.id;
             if (tc.function?.name) toolCalls[idx].name += tc.function.name;
@@ -993,7 +1014,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   });
 
   const emit = (frame: object) => {
-    reply.raw.write(`data: ${JSON.stringify(frame)}\n\n`);
+    reply.raw.write("data: " + JSON.stringify(frame) + "\n\n");
   };
 
   let assistantText = "";
