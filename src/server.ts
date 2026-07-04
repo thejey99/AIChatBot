@@ -44,6 +44,11 @@ const MAX_IMAGE_BYTES = 900_000;
 // never contains literal backticks (they corrupt when shared via markdown).
 const FENCE_HINT = String.fromCharCode(96, 96, 96);
 
+// Automatic memory sweep: a conversation qualifies when idle this long AND
+// has new activity since its last extraction watermark.
+const MEMORY_IDLE_MS = 30 * 60 * 1000;
+const SWEEP_LIMIT = 2; // max extractions per sweep, bounds cost + latency
+
 interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
@@ -517,6 +522,147 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
   log.info({ conversationId, folded: toFold.length }, "conversation compacted");
 }
 
+// ---------- Memory extraction (shared by button + auto-sweep) ----------
+
+const EXTRACTION_INSTRUCTIONS =
+  "You maintain a long-term memory of durable facts about the user.\n\n" +
+  "Given the conversation transcript and the list of EXISTING facts, respond with ONLY a JSON object, no markdown fences, in exactly this shape:\n" +
+  '{"new_facts": ["..."], "deactivate_ids": ["..."]}\n\n' +
+  "Rules:\n" +
+  '- new_facts: durable facts about the user worth remembering across future conversations (preferences, projects, people, decisions, circumstances). Write each as one short standalone sentence about "the user".\n' +
+  "- Do NOT include facts already covered by an existing fact.\n" +
+  "- Do NOT include trivia, small talk, or one-off details with no future value.\n" +
+  "- deactivate_ids: IDs of existing facts that this conversation shows are now false, outdated, or superseded.\n" +
+  '- If nothing qualifies, return {"new_facts": [], "deactivate_ids": []}.';
+
+interface ExtractionResult {
+  new_facts: string[];
+  deactivate_ids: string[];
+}
+
+function parseExtraction(raw: string): ExtractionResult | null {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  try {
+    const json = JSON.parse(cleaned);
+    if (!Array.isArray(json.new_facts) || !Array.isArray(json.deactivate_ids)) return null;
+    return {
+      new_facts: json.new_facts.filter((f: unknown) => typeof f === "string" && f.trim()),
+      deactivate_ids: json.deactivate_ids.filter((i: unknown) => typeof i === "string"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run memory extraction for one conversation, on behalf of its owner.
+ * Stamps memoryExtractedAt so the sweep never re-processes an unchanged
+ * conversation. Returns null on failure (harmless; retried next sweep).
+ */
+async function extractConversationMemory(
+  user: AuthedUser,
+  conversationId: string,
+  log: any
+): Promise<{ added: string[]; deactivated: number } | null> {
+  const convRef = conversations.doc(conversationId);
+
+  const msgSnap = await convRef.collection("messages").orderBy("createdAt", "asc").get();
+  if (msgSnap.empty) return { added: [], deactivated: 0 };
+
+  const transcript = msgSnap.docs
+    .map((d) => {
+      const who = d.data().role === "user" ? "User" : "Assistant";
+      const img = d.data().image ? " [image attached]" : "";
+      return who + ":" + img + " " + d.data().content;
+    })
+    .join("\n");
+
+  const existing = await loadActiveFacts(user);
+  const existingBlock =
+    existing.length > 0
+      ? existing.map((f) => "[" + f.id + "] " + f.text).join("\n")
+      : "(none)";
+
+  const extractionMessages: ChatMessage[] = [
+    { role: "system", content: EXTRACTION_INSTRUCTIONS },
+    {
+      role: "user",
+      content: "EXISTING FACTS:\n" + existingBlock + "\n\nTRANSCRIPT:\n" + transcript,
+    },
+  ];
+
+  let result: ExtractionResult | null = null;
+  for (let attempt = 0; attempt < 2 && !result; attempt++) {
+    try {
+      const raw = await llmComplete(extractionMessages);
+      result = parseExtraction(raw);
+    } catch (err) {
+      log.error(err, "extraction call failed");
+    }
+  }
+
+  if (!result) return null;
+
+  const validIds = new Set(existing.map((f) => f.id));
+  const batch = db.batch();
+
+  let deactivated = 0;
+  for (const id of result.deactivate_ids) {
+    if (!validIds.has(id)) continue;
+    batch.update(memory.doc(id), { active: false });
+    deactivated++;
+  }
+
+  for (const text of result.new_facts) {
+    batch.set(memory.doc(), {
+      uid: user.uid,
+      text: text.trim(),
+      active: true,
+      createdAt: FieldValue.serverTimestamp(),
+      sourceConversationId: conversationId,
+    });
+  }
+
+  // Watermark: this conversation is extracted as of now
+  batch.update(convRef, { memoryExtractedAt: FieldValue.serverTimestamp() });
+
+  await batch.commit();
+
+  log.info(
+    { conversationId, added: result.new_facts.length, deactivated, user: user.email },
+    "memory extraction applied"
+  );
+
+  return { added: result.new_facts, deactivated };
+}
+
+// ---------- Automatic memory sweep ----------
+
+async function sweepIdleConversations(user: AuthedUser, log: any): Promise<void> {
+  const now = Date.now();
+  const snap = await conversations.orderBy("updatedAt", "desc").limit(100).get();
+
+  const candidates = snap.docs.filter((d) => {
+    if (!ownsDoc(user, d.data())) return false;
+    const updatedAt = tsToMillis(d.data().updatedAt);
+    if (!updatedAt) return false;
+    if (now - updatedAt < MEMORY_IDLE_MS) return false; // still active
+    const extractedAt = tsToMillis(d.data().memoryExtractedAt);
+    return !extractedAt || extractedAt < updatedAt; // new activity since last sweep
+  });
+
+  for (const doc of candidates.slice(0, SWEEP_LIMIT)) {
+    try {
+      await extractConversationMemory(user, doc.id, log);
+    } catch (err) {
+      log.error({ conversationId: doc.id, err }, "auto memory sweep failed");
+    }
+  }
+}
+
 // ---------- Routes: health & me ----------
 
 app.get("/api/health", async () => ({ ok: true }));
@@ -733,40 +879,7 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
   }
 );
 
-// ---------- Route: extraction ----------
-
-const EXTRACTION_INSTRUCTIONS =
-  "You maintain a long-term memory of durable facts about the user.\n\n" +
-  "Given the conversation transcript and the list of EXISTING facts, respond with ONLY a JSON object, no markdown fences, in exactly this shape:\n" +
-  '{"new_facts": ["..."], "deactivate_ids": ["..."]}\n\n' +
-  "Rules:\n" +
-  '- new_facts: durable facts about the user worth remembering across future conversations (preferences, projects, people, decisions, circumstances). Write each as one short standalone sentence about "the user".\n' +
-  "- Do NOT include facts already covered by an existing fact.\n" +
-  "- Do NOT include trivia, small talk, or one-off details with no future value.\n" +
-  "- deactivate_ids: IDs of existing facts that this conversation shows are now false, outdated, or superseded.\n" +
-  '- If nothing qualifies, return {"new_facts": [], "deactivate_ids": []}.';
-
-interface ExtractionResult {
-  new_facts: string[];
-  deactivate_ids: string[];
-}
-
-function parseExtraction(raw: string): ExtractionResult | null {
-  const cleaned = raw
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "");
-  try {
-    const json = JSON.parse(cleaned);
-    if (!Array.isArray(json.new_facts) || !Array.isArray(json.deactivate_ids)) return null;
-    return {
-      new_facts: json.new_facts.filter((f: unknown) => typeof f === "string" && f.trim()),
-      deactivate_ids: json.deactivate_ids.filter((i: unknown) => typeof i === "string"),
-    };
-  } catch {
-    return null;
-  }
-}
+// ---------- Route: manual extraction ("Remember" button) ----------
 
 app.post<{ Params: { id: string } }>(
   "/api/conversations/:id/remember",
@@ -781,69 +894,11 @@ app.post<{ Params: { id: string } }>(
       return reply.code(404).send({ error: "Not found" });
     }
 
-    const msgSnap = await convRef.collection("messages").orderBy("createdAt", "asc").get();
-    if (msgSnap.empty) {
-      return reply.code(400).send({ error: "Conversation has no messages" });
-    }
-
-    const transcript = msgSnap.docs
-      .map((d) => {
-        const who = d.data().role === "user" ? "User" : "Assistant";
-        const img = d.data().image ? " [image attached]" : "";
-        return who + ":" + img + " " + d.data().content;
-      })
-      .join("\n");
-
-    const existing = await loadActiveFacts(user);
-    const existingBlock =
-      existing.length > 0
-        ? existing.map((f) => "[" + f.id + "] " + f.text).join("\n")
-        : "(none)";
-
-    const extractionMessages: ChatMessage[] = [
-      { role: "system", content: EXTRACTION_INSTRUCTIONS },
-      {
-        role: "user",
-        content: "EXISTING FACTS:\n" + existingBlock + "\n\nTRANSCRIPT:\n" + transcript,
-      },
-    ];
-
-    let result: ExtractionResult | null = null;
-    for (let attempt = 0; attempt < 2 && !result; attempt++) {
-      try {
-        const raw = await llmComplete(extractionMessages);
-        result = parseExtraction(raw);
-      } catch (err) {
-        request.log.error(err, "extraction call failed");
-      }
-    }
-
+    const result = await extractConversationMemory(user, conversationId, request.log);
     if (!result) {
       return reply.code(502).send({ error: "Extraction failed after retry" });
     }
-
-    const validIds = new Set(existing.map((f) => f.id));
-    const batch = db.batch();
-
-    let deactivated = 0;
-    for (const id of result.deactivate_ids) {
-      if (!validIds.has(id)) continue;
-      batch.update(memory.doc(id), { active: false });
-      deactivated++;
-    }
-
-    for (const text of result.new_facts) {
-      batch.set(memory.doc(), {
-        uid: user.uid,
-        text: text.trim(),
-        active: true,
-        createdAt: FieldValue.serverTimestamp(),
-        sourceConversationId: conversationId,
-      });
-    }
-
-    await batch.commit();
-    return { added: result.new_facts, deactivated };
+    return result;
   }
 );
 
@@ -1117,6 +1172,12 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
       await maybeCompact(conversationId, request.log);
     } catch (err) {
       request.log.error(err, "compaction failed (will retry next turn)");
+    }
+
+    try {
+      await sweepIdleConversations(user, request.log);
+    } catch (err) {
+      request.log.error(err, "memory sweep failed (will retry next request)");
     }
   }
 
