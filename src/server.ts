@@ -33,9 +33,12 @@ const PRO_BASE_URL = process.env.PRO_BASE_URL ?? "https://api.groq.com/openai/v1
 const PRO_MODEL = process.env.PRO_MODEL ?? "openai/gpt-oss-120b";
 const PRO_API_KEY = process.env.PRO_API_KEY ?? "";
 
-// Web search (Tavily). If unset, the search tool is not offered at all.
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? "";
 const MAX_SEARCH_ROUNDS = 3;
+
+// Max accepted image payload (base64 data URL). Firestore docs cap at 1MB;
+// this leaves headroom for the rest of the message document.
+const MAX_IMAGE_BYTES = 900_000;
 
 interface ProviderConfig {
   baseUrl: string;
@@ -87,7 +90,10 @@ const db = getFirestore();
 
 // ---------- Server ----------
 
-const app = Fastify({ logger: true });
+const app = Fastify({
+  logger: true,
+  bodyLimit: 2 * 1024 * 1024, // allow image payloads (default is 1MB)
+});
 await app.register(cors, {
   origin: ALLOWED_ORIGIN,
   exposedHeaders: ["X-Conversation-Id"],
@@ -195,9 +201,13 @@ function ownsDoc(
 
 // ---------- Types ----------
 
+type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 interface ChatMessage {
   role: "user" | "assistant" | "system" | "tool";
-  content: string | null;
+  content: string | ContentPart[] | null;
   tool_calls?: Array<{
     id: string;
     type: "function";
@@ -212,6 +222,7 @@ interface ChatBody {
   messages?: ChatMessage[];
   system?: string;
   model?: string;
+  image?: string; // data URL, image/* only
 }
 
 interface MemoryFact {
@@ -255,10 +266,21 @@ async function loadConversationContext(
   }
 
   const snap = await query.get();
-  const history: ChatMessage[] = snap.docs.map((d) => ({
-    role: d.data().role as "user" | "assistant",
-    content: String(d.data().content ?? ""),
-  }));
+  const history: ChatMessage[] = snap.docs.map((d) => {
+    const role = d.data().role as "user" | "assistant";
+    const text = String(d.data().content ?? "");
+    const image = d.data().image as string | undefined;
+
+    // Messages with an attached image become multipart content so the
+    // model can keep seeing the image in follow-up turns.
+    if (image && role === "user") {
+      const parts: ContentPart[] = [];
+      if (text) parts.push({ type: "text", text });
+      parts.push({ type: "image_url", image_url: { url: image } });
+      return { role, content: parts };
+    }
+    return { role, content: text };
+  });
 
   const systemBlocks: string[] = [];
   if (summary) {
@@ -445,7 +467,11 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
   if (toFold.length === 0) return;
 
   const batchText = toFold
-    .map((d) => `${d.data().role === "user" ? "User" : "Assistant"}: ${d.data().content}`)
+    .map((d) => {
+      const who = d.data().role === "user" ? "User" : "Assistant";
+      const img = d.data().image ? " [image attached]" : "";
+      return `${who}:${img} ${d.data().content}`;
+    })
     .join("\n");
 
   const updatedSummary = await llmComplete([
@@ -573,6 +599,7 @@ app.get<{ Params: { id: string } }>(
     return snap.docs.map((d) => ({
       role: d.data().role,
       content: d.data().content,
+      image: d.data().image ?? null,
       sources: d.data().sources ?? null,
       createdAt: tsToMillis(d.data().createdAt),
     }));
@@ -737,7 +764,11 @@ app.post<{ Params: { id: string } }>(
     }
 
     const transcript = msgSnap.docs
-      .map((d) => `${d.data().role === "user" ? "User" : "Assistant"}: ${d.data().content}`)
+      .map((d) => {
+        const who = d.data().role === "user" ? "User" : "Assistant";
+        const img = d.data().image ? " [image attached]" : "";
+        return `${who}:${img} ${d.data().content}`;
+      })
       .join("\n");
 
     const existing = await loadActiveFacts(user);
@@ -793,7 +824,7 @@ app.post<{ Params: { id: string } }>(
   }
 );
 
-// ---------- Route: chat (tool-calling search loop + citations) ----------
+// ---------- Route: chat ----------
 
 interface StreamedToolCall {
   id: string;
@@ -884,14 +915,30 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   const body = request.body ?? {};
   const baseSystem =
     body.system ?? "You are a helpful personal assistant. Be concise and direct.";
-  const provider = MODEL_ALIASES[body.model ?? "default"] ?? DEFAULT_PROVIDER;
+
+  // Validate image payload if present
+  let image: string | undefined;
+  if (typeof body.image === "string" && body.image) {
+    if (!body.image.startsWith("data:image/")) {
+      return reply.code(400).send({ error: "image must be a data:image/* URL" });
+    }
+    if (body.image.length > MAX_IMAGE_BYTES) {
+      return reply.code(400).send({ error: "Image too large (max ~900KB after compression)" });
+    }
+    image = body.image;
+  }
+
+  // Images force the multimodal default lane; PRO (Groq) is text-only.
+  const provider = image
+    ? DEFAULT_PROVIDER
+    : MODEL_ALIASES[body.model ?? "default"] ?? DEFAULT_PROVIDER;
 
   const facts = await loadActiveFacts(user);
 
   let workingMessages: ChatMessage[];
   let conversationId: string | null = null;
 
-  if (typeof body.message === "string" && body.message.trim()) {
+  if (typeof body.message === "string" && (body.message.trim() || image)) {
     const userText = body.message.trim();
 
     if (body.conversationId) {
@@ -905,7 +952,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     } else {
       const doc = await conversations.add({
         uid: user.uid,
-        title: userText.slice(0, 60),
+        title: (userText || "Image").slice(0, 60),
         pinned: false,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
@@ -917,6 +964,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     await convRef.collection("messages").add({
       role: "user",
       content: userText,
+      ...(image ? { image } : {}),
       createdAt: FieldValue.serverTimestamp(),
     });
 
@@ -1050,7 +1098,13 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   }
 
   request.log.info(
-    { user: user.email, conversationId, model: provider.model, searches: searchesUsed },
+    {
+      user: user.email,
+      conversationId,
+      model: provider.model,
+      searches: searchesUsed,
+      hasImage: Boolean(image),
+    },
     "chat completed"
   );
 });
