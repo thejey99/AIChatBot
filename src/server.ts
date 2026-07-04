@@ -17,22 +17,44 @@ const ALLOWED_EMAILS = new Set(
 
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
 
+// ---- Provider configs ----
+// Default/fast lane: Gemini Flash (also used for extraction + compaction)
 const LLM_BASE_URL =
   process.env.LLM_BASE_URL ??
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const LLM_MODEL = process.env.LLM_MODEL ?? "gemini-2.5-flash";
-const LLM_PRO_MODEL = process.env.LLM_PRO_MODEL ?? "gemini-2.5-pro";
 const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
 
-// Client sends an alias, never a raw model name. Unknown alias -> default.
-const MODEL_ALIASES: Record<string, string> = {
-  default: LLM_MODEL,
-  pro: LLM_PRO_MODEL,
+// Pro lane: OpenRouter free reasoning model by default.
+// If PRO_API_KEY is not set, the "pro" alias silently falls back to the
+// default lane so nothing breaks before you add the key.
+const PRO_BASE_URL = process.env.PRO_BASE_URL ?? "https://openrouter.ai/api/v1";
+const PRO_MODEL = process.env.PRO_MODEL ?? "deepseek/deepseek-r1:free";
+const PRO_API_KEY = process.env.PRO_API_KEY ?? "";
+
+interface ProviderConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+const DEFAULT_PROVIDER: ProviderConfig = {
+  baseUrl: LLM_BASE_URL,
+  apiKey: LLM_API_KEY,
+  model: LLM_MODEL,
 };
 
-// Compaction tuning:
-// COMPACT_TRIGGER: when this many messages sit outside the summary, compact.
-// COMPACT_KEEP:    how many recent messages stay verbatim after compaction.
+const PRO_PROVIDER: ProviderConfig = PRO_API_KEY
+  ? { baseUrl: PRO_BASE_URL, apiKey: PRO_API_KEY, model: PRO_MODEL }
+  : DEFAULT_PROVIDER;
+
+// Client sends an alias, never a raw model or URL. Unknown alias -> default.
+const MODEL_ALIASES: Record<string, ProviderConfig> = {
+  default: DEFAULT_PROVIDER,
+  pro: PRO_PROVIDER,
+};
+
+// Compaction tuning
 const COMPACT_TRIGGER = 50;
 const COMPACT_KEEP = 20;
 
@@ -206,16 +228,25 @@ function buildSystemPrompt(
 
 // ---------- LLM helpers ----------
 
+function providerHeaders(provider: ProviderConfig): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${provider.apiKey}`,
+  };
+  // OpenRouter attribution headers (optional but recommended by them)
+  if (provider.baseUrl.includes("openrouter.ai")) {
+    headers["X-Title"] = "Personal AI Chat";
+  }
+  return headers;
+}
+
 // Non-streaming utility calls (extraction, compaction) always use the
-// default/Flash model — Pro's small daily quota is reserved for chat.
+// default/Flash lane — reasoning-model quota is reserved for chat.
 async function llmComplete(messages: ChatMessage[]): Promise<string> {
-  const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+  const res = await fetch(`${DEFAULT_PROVIDER.baseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${LLM_API_KEY}`,
-    },
-    body: JSON.stringify({ model: LLM_MODEL, messages, stream: false }),
+    headers: providerHeaders(DEFAULT_PROVIDER),
+    body: JSON.stringify({ model: DEFAULT_PROVIDER.model, messages, stream: false }),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
@@ -513,8 +544,8 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   const baseSystem =
     body.system ?? "You are a helpful personal assistant. Be concise and direct.";
 
-  // Resolve model alias -> real model name. Unknown/missing -> default.
-  const chatModel = MODEL_ALIASES[body.model ?? "default"] ?? LLM_MODEL;
+  // Resolve alias -> provider config. Unknown/missing -> default lane.
+  const provider = MODEL_ALIASES[body.model ?? "default"] ?? DEFAULT_PROVIDER;
 
   const facts = await loadActiveFacts();
 
@@ -556,14 +587,11 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     return reply.code(400).send({ error: "Provide 'message' or 'messages'" });
   }
 
-  const upstream = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+  const upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${LLM_API_KEY}`,
-    },
+    headers: providerHeaders(provider),
     body: JSON.stringify({
-      model: chatModel,
+      model: provider.model,
       messages: providerMessages,
       stream: true,
     }),
@@ -571,16 +599,17 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
 
   if (!upstream.ok || !upstream.body) {
     const detail = await upstream.text().catch(() => "");
-    request.log.error({ status: upstream.status, detail }, "LLM provider error");
+    request.log.error(
+      { status: upstream.status, model: provider.model, detail },
+      "LLM provider error"
+    );
     const friendly =
       upstream.status === 429
         ? "Model rate limit or daily quota hit. If you were using Pro, switch back to fast."
         : upstream.status === 404
-        ? "Model name not recognized by provider. Check LLM_MODEL / LLM_PRO_MODEL env vars."
+        ? "Model name not recognized by provider. Check LLM_MODEL / PRO_MODEL env vars."
         : "Model provider error.";
-    return reply
-      .code(502)
-      .send({ error: friendly, status: upstream.status });
+    return reply.code(502).send({ error: friendly, status: upstream.status });
   }
 
   reply.raw.writeHead(200, {
@@ -648,7 +677,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     {
       user: user.email,
       conversationId,
-      model: chatModel,
+      model: provider.model,
       facts: facts.length,
       chars: assistantText.length,
     },
