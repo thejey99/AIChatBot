@@ -23,7 +23,11 @@ const LLM_BASE_URL =
 const LLM_MODEL = process.env.LLM_MODEL ?? "gemini-2.5-flash";
 const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
 
-const HISTORY_LIMIT = 30;
+// Compaction tuning:
+// COMPACT_TRIGGER: when this many messages sit outside the summary, compact.
+// COMPACT_KEEP:    how many recent messages stay verbatim after compaction.
+const COMPACT_TRIGGER = 50;
+const COMPACT_KEEP = 20;
 
 const SECRET_FILE_PATH = "/etc/secrets/firebase-service-account.json";
 
@@ -114,6 +118,11 @@ interface MemoryFact {
   sourceConversationId: string | null;
 }
 
+interface ConversationContext {
+  systemBlocks: string[];
+  history: ChatMessage[];
+}
+
 // ---------- Firestore helpers ----------
 
 const conversations = db.collection("conversations");
@@ -123,18 +132,40 @@ function tsToMillis(v: unknown): number | null {
   return v instanceof Timestamp ? v.toMillis() : null;
 }
 
-async function loadHistory(conversationId: string): Promise<ChatMessage[]> {
-  const snap = await conversations
+/**
+ * Load context for a conversation: rolling summary (if any) as a system
+ * block, plus all messages after the summary watermark.
+ */
+async function loadConversationContext(
+  conversationId: string
+): Promise<ConversationContext> {
+  const convSnap = await conversations.doc(conversationId).get();
+  const summary: string = convSnap.data()?.summary ?? "";
+  const summaryUpTo: Timestamp | null = convSnap.data()?.summaryUpTo ?? null;
+
+  let query = conversations
     .doc(conversationId)
     .collection("messages")
-    .orderBy("createdAt", "desc")
-    .limit(HISTORY_LIMIT)
-    .get();
+    .orderBy("createdAt", "asc");
 
-  return snap.docs
-    .map((d) => d.data() as { role: "user" | "assistant"; content: string })
-    .reverse()
-    .map((m) => ({ role: m.role, content: m.content }));
+  if (summaryUpTo) {
+    query = query.where("createdAt", ">", summaryUpTo);
+  }
+
+  const snap = await query.get();
+  const history: ChatMessage[] = snap.docs.map((d) => ({
+    role: d.data().role as "user" | "assistant",
+    content: String(d.data().content ?? ""),
+  }));
+
+  const systemBlocks: string[] = [];
+  if (summary) {
+    systemBlocks.push(
+      `Summary of the earlier part of this conversation (older messages have been condensed):\n${summary}`
+    );
+  }
+
+  return { systemBlocks, history };
 }
 
 async function loadActiveFacts(): Promise<MemoryFact[]> {
@@ -150,14 +181,23 @@ async function loadActiveFacts(): Promise<MemoryFact[]> {
   return facts;
 }
 
-function buildSystemPrompt(baseSystem: string, facts: MemoryFact[]): string {
-  if (facts.length === 0) return baseSystem;
-  const factLines = facts.map((f) => `- ${f.text}`).join("\n");
-  return (
-    `${baseSystem}\n\n` +
-    `You have persistent memory of the user from previous conversations. ` +
-    `Use these facts naturally when relevant; do not recite them unprompted:\n${factLines}`
-  );
+function buildSystemPrompt(
+  baseSystem: string,
+  facts: MemoryFact[],
+  extraBlocks: string[]
+): string {
+  const parts = [baseSystem];
+
+  if (facts.length > 0) {
+    const factLines = facts.map((f) => `- ${f.text}`).join("\n");
+    parts.push(
+      `You have persistent memory of the user from previous conversations. ` +
+        `Use these facts naturally when relevant; do not recite them unprompted:\n${factLines}`
+    );
+  }
+
+  parts.push(...extraBlocks);
+  return parts.join("\n\n");
 }
 
 // ---------- LLM helpers ----------
@@ -177,6 +217,73 @@ async function llmComplete(messages: ChatMessage[]): Promise<string> {
   }
   const json = await res.json();
   return String(json.choices?.[0]?.message?.content ?? "");
+}
+
+// ---------- Compaction ----------
+
+const COMPACTION_INSTRUCTIONS = `You maintain a rolling summary of a conversation between a user and an assistant.
+
+You will receive the PREVIOUS SUMMARY (possibly empty) and a batch of OLDER MESSAGES that must now be folded into it.
+
+Write an updated summary that:
+- Preserves facts, decisions, preferences, open questions, and anything either party may refer back to later
+- Preserves specific names, numbers, code identifiers, and URLs mentioned
+- Drops pleasantries and redundancy
+- Is written in compact plain prose, at most ~400 words
+
+Respond with ONLY the updated summary text.`;
+
+/**
+ * If enough messages have accumulated past the summary watermark, fold the
+ * oldest of them into the rolling summary. Runs after the reply is sent,
+ * so it never adds user-facing latency. Failures are logged and harmless —
+ * the next turn just retries.
+ */
+async function maybeCompact(conversationId: string, log: any): Promise<void> {
+  const convRef = conversations.doc(conversationId);
+  const convSnap = await convRef.get();
+  const prevSummary: string = convSnap.data()?.summary ?? "";
+  const summaryUpTo: Timestamp | null = convSnap.data()?.summaryUpTo ?? null;
+
+  let tailQuery = convRef.collection("messages").orderBy("createdAt", "asc");
+  if (summaryUpTo) {
+    tailQuery = tailQuery.where("createdAt", ">", summaryUpTo);
+  }
+
+  const tailSnap = await tailQuery.get();
+  if (tailSnap.size <= COMPACT_TRIGGER) return;
+
+  // Fold everything except the newest COMPACT_KEEP messages
+  const toFold = tailSnap.docs.slice(0, tailSnap.size - COMPACT_KEEP);
+  if (toFold.length === 0) return;
+
+  const batchText = toFold
+    .map((d) => `${d.data().role === "user" ? "User" : "Assistant"}: ${d.data().content}`)
+    .join("\n");
+
+  const updatedSummary = await llmComplete([
+    { role: "system", content: COMPACTION_INSTRUCTIONS },
+    {
+      role: "user",
+      content: `PREVIOUS SUMMARY:\n${prevSummary || "(empty)"}\n\nOLDER MESSAGES:\n${batchText}`,
+    },
+  ]);
+
+  if (!updatedSummary.trim()) {
+    log.warn({ conversationId }, "compaction produced empty summary; skipping");
+    return;
+  }
+
+  const lastFolded = toFold[toFold.length - 1];
+  await convRef.update({
+    summary: updatedSummary.trim(),
+    summaryUpTo: lastFolded.data().createdAt,
+  });
+
+  log.info(
+    { conversationId, folded: toFold.length, kept: COMPACT_KEEP },
+    "conversation compacted"
+  );
 }
 
 // ---------- Routes: conversations ----------
@@ -300,7 +407,6 @@ interface ExtractionResult {
 }
 
 function parseExtraction(raw: string): ExtractionResult | null {
-  // Tolerate accidental code fences despite instructions
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   try {
     const json = JSON.parse(cleaned);
@@ -350,7 +456,6 @@ app.post<{ Params: { id: string } }>(
       },
     ];
 
-    // One attempt + one retry on parse failure
     let result: ExtractionResult | null = null;
     for (let attempt = 0; attempt < 2 && !result; attempt++) {
       try {
@@ -366,13 +471,12 @@ app.post<{ Params: { id: string } }>(
       return reply.code(502).send({ error: "Extraction failed after retry" });
     }
 
-    // Apply: deactivate superseded facts, add new ones
     const validIds = new Set(existing.map((f) => f.id));
     const batch = db.batch();
 
     let deactivated = 0;
     for (const id of result.deactivate_ids) {
-      if (!validIds.has(id)) continue; // never trust model-invented IDs
+      if (!validIds.has(id)) continue;
       batch.update(memory.doc(id), { active: false });
       deactivated++;
     }
@@ -410,9 +514,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   const baseSystem =
     body.system ?? "You are a helpful personal assistant. Be concise and direct.";
 
-  // Memory injection happens for every chat, both paths
   const facts = await loadActiveFacts();
-  const systemPrompt = buildSystemPrompt(baseSystem, facts);
 
   let providerMessages: ChatMessage[];
   let conversationId: string | null = null;
@@ -439,9 +541,11 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    const history = await loadHistory(conversationId);
-    providerMessages = [{ role: "system", content: systemPrompt }, ...history];
+    const context = await loadConversationContext(conversationId);
+    const systemPrompt = buildSystemPrompt(baseSystem, facts, context.systemBlocks);
+    providerMessages = [{ role: "system", content: systemPrompt }, ...context.history];
   } else if (Array.isArray(body.messages) && body.messages.length > 0) {
+    const systemPrompt = buildSystemPrompt(baseSystem, facts, []);
     providerMessages = [
       { role: "system", content: systemPrompt },
       ...body.messages.filter((m) => m.role === "user" || m.role === "assistant"),
@@ -524,6 +628,14 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
       createdAt: FieldValue.serverTimestamp(),
     });
     await convRef.update({ updatedAt: FieldValue.serverTimestamp() });
+
+    // Post-response compaction: user already has their reply; this is
+    // pure bookkeeping and never blocks the stream.
+    try {
+      await maybeCompact(conversationId, request.log);
+    } catch (err) {
+      request.log.error(err, "compaction failed (will retry next turn)");
+    }
   }
 
   request.log.info(
