@@ -9,8 +9,6 @@ import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-// Bootstrap admins: seeded into the Firestore allowlist on first boot.
-// After that, the allowlist is managed from the admin UI, not this var.
 const BOOTSTRAP_ADMINS = (
   process.env.BOOTSTRAP_ADMINS ??
   "jryan@charlestownehotels.com,john99ran@gmail.com"
@@ -19,14 +17,12 @@ const BOOTSTRAP_ADMINS = (
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
 
-// Email whose pre-accounts data (docs with no uid) gets claimed.
 const LEGACY_OWNER_EMAIL = (process.env.LEGACY_OWNER_EMAIL ?? "john99ran@gmail.com")
   .trim()
   .toLowerCase();
 
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
 
-// ---- Provider lanes ----
 const LLM_BASE_URL =
   process.env.LLM_BASE_URL ??
   "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -36,6 +32,10 @@ const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
 const PRO_BASE_URL = process.env.PRO_BASE_URL ?? "https://api.groq.com/openai/v1";
 const PRO_MODEL = process.env.PRO_MODEL ?? "openai/gpt-oss-120b";
 const PRO_API_KEY = process.env.PRO_API_KEY ?? "";
+
+// Web search (Tavily). If unset, the search tool is not offered at all.
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? "";
+const MAX_SEARCH_ROUNDS = 3;
 
 interface ProviderConfig {
   baseUrl: string;
@@ -100,7 +100,7 @@ const memory = db.collection("memory");
 const allowlist = db.collection("allowlist");
 
 // ---------- Allowlist bootstrap ----------
-// Seed bootstrap admins once, on startup. Idempotent.
+
 async function seedAllowlist(): Promise<void> {
   for (const email of BOOTSTRAP_ADMINS) {
     const ref = allowlist.doc(email);
@@ -114,7 +114,6 @@ async function seedAllowlist(): Promise<void> {
       });
       console.log(`Seeded bootstrap admin: ${email}`);
     } else if (snap.data()?.role !== "admin") {
-      // Ensure bootstrap emails are always admin
       await ref.update({ role: "admin" });
     }
   }
@@ -142,7 +141,7 @@ async function requireAllowedUser(authHeader: string | undefined): Promise<Authe
     });
 
   const email = decoded.email?.toLowerCase();
-if (!email || !decoded.email_verified) {
+  if (!email || !decoded.email_verified) {
     throw { statusCode: 403, message: "Email not verified", attemptedEmail: email };
   }
 
@@ -182,13 +181,8 @@ async function guardAdmin(request: any, reply: any): Promise<AuthedUser | null> 
   return user;
 }
 
-// ---------- Ownership helpers ----------
+// ---------- Ownership ----------
 
-/**
- * Returns true if this user may access this doc. A doc with no uid is
- * legacy data, owned by LEGACY_OWNER_EMAIL. On first access by that owner,
- * the doc is claimed (uid stamped in) so it stops being ambiguous.
- */
 function ownsDoc(
   user: AuthedUser,
   data: FirebaseFirestore.DocumentData | undefined
@@ -196,15 +190,21 @@ function ownsDoc(
   if (!data) return false;
   const docUid = data.uid as string | undefined;
   if (docUid) return docUid === user.uid;
-  // Legacy doc (no uid): belongs to the legacy owner
   return user.email === LEGACY_OWNER_EMAIL;
 }
 
 // ---------- Types ----------
 
+// Loose message type: also carries tool-calling fields when present.
 interface ChatMessage {
-  role: "user" | "assistant" | "system";
-  content: string;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string | null;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
 }
 
 interface ChatBody {
@@ -266,7 +266,6 @@ async function loadConversationContext(
   return { systemBlocks, history };
 }
 
-// Memory is now per-user. Legacy facts (no uid) count for the legacy owner.
 async function loadActiveFacts(user: AuthedUser): Promise<MemoryFact[]> {
   const snap = await memory.where("active", "==", true).get();
   const facts = snap.docs
@@ -288,6 +287,15 @@ function buildSystemPrompt(
   extraBlocks: string[]
 ): string {
   const parts = [baseSystem];
+
+  if (TAVILY_API_KEY) {
+    parts.push(
+      `You have a web_search tool. Use it when the question involves current events, ` +
+        `recent information, prices, weather, news, or anything you are unsure is up to date. ` +
+        `Do not use it for stable knowledge, personal conversation, or things already in context. ` +
+        `When you use search results, mention your sources briefly.`
+    );
+  }
 
   if (facts.length > 0) {
     const factLines = facts.map((f) => `- ${f.text}`).join("\n");
@@ -326,6 +334,63 @@ async function llmComplete(messages: ChatMessage[]): Promise<string> {
   }
   const json = await res.json();
   return String(json.choices?.[0]?.message?.content ?? "");
+}
+
+// ---------- Web search (Tavily) ----------
+
+const SEARCH_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "web_search",
+    description:
+      "Search the web for current, real-time, or recent information. " +
+      "Use for news, prices, weather, sports, recent releases, or anything that may have changed recently.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "A concise search query, 2-6 words.",
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
+
+async function tavilySearch(query: string, log: any): Promise<string> {
+  try {
+    const res = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${TAVILY_API_KEY}`,
+      },
+      body: JSON.stringify({
+        query,
+        max_results: 5,
+        include_answer: true,
+        search_depth: "basic",
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      log.error({ status: res.status, detail: detail.slice(0, 200) }, "Tavily error");
+      return `Search failed (${res.status}). Answer from your own knowledge and say you could not verify current information.`;
+    }
+
+    const json = await res.json();
+    const parts: string[] = [];
+    if (json.answer) parts.push(`Summary: ${json.answer}`);
+    for (const r of json.results ?? []) {
+      parts.push(`- ${r.title} (${r.url})\n  ${String(r.content ?? "").slice(0, 400)}`);
+    }
+    return parts.length > 0 ? parts.join("\n") : "No results found.";
+  } catch (err) {
+    log.error(err, "Tavily request failed");
+    return "Search failed. Answer from your own knowledge and say you could not verify current information.";
+  }
 }
 
 // ---------- Compaction ----------
@@ -385,7 +450,7 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
   log.info({ conversationId, folded: toFold.length }, "conversation compacted");
 }
 
-// ---------- Route: health & me ----------
+// ---------- Routes: health & me ----------
 
 app.get("/api/health", async () => ({ ok: true }));
 
@@ -401,12 +466,14 @@ app.get("/api/allowlist", async (request, reply) => {
   const user = await guardAdmin(request, reply);
   if (!user) return;
 
-  const snap = await allowlist.orderBy("addedAt", "desc").get();
-  return snap.docs.map((d) => ({
+  const snap = await allowlist.get();
+  const entries = snap.docs.map((d) => ({
     email: d.id,
     role: d.data().role ?? "user",
     addedAt: tsToMillis(d.data().addedAt),
   }));
+  entries.sort((a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0));
+  return entries;
 });
 
 app.post<{ Body: { email?: string; role?: string } }>(
@@ -452,7 +519,6 @@ app.get("/api/conversations", async (request, reply) => {
   const user = await guard(request, reply);
   if (!user) return;
 
-  // Fetch recent, filter to this user (incl. legacy), pins first.
   const snap = await conversations.orderBy("updatedAt", "desc").limit(200).get();
   const mine = snap.docs
     .filter((d) => ownsDoc(user, d.data()))
@@ -506,7 +572,6 @@ app.patch<{ Params: { id: string }; Body: { pinned?: boolean } }>(
 
     const updates: Record<string, unknown> = {};
     if (typeof request.body?.pinned === "boolean") updates.pinned = request.body.pinned;
-    // Claim legacy docs on write
     if (!convSnap.data()?.uid) updates.uid = user.uid;
 
     if (Object.keys(updates).length === 0) {
@@ -589,7 +654,7 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
     if (typeof request.body?.active === "boolean") {
       updates.active = request.body.active;
     }
-    if (!snap.data()?.uid) updates.uid = user.uid; // claim legacy
+    if (!snap.data()?.uid) updates.uid = user.uid;
     if (Object.keys(updates).length === 0) {
       return reply.code(400).send({ error: "Nothing to update" });
     }
@@ -707,7 +772,94 @@ app.post<{ Params: { id: string } }>(
   }
 );
 
-// ---------- Route: chat ----------
+// ---------- Route: chat (with tool-calling search loop) ----------
+
+interface StreamedToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/**
+ * Run one streaming completion. Content deltas are emitted to the client
+ * via emit(); tool calls are accumulated and returned. Returns the full
+ * content text and any tool calls the model made.
+ */
+async function streamOneRound(
+  provider: ProviderConfig,
+  messages: ChatMessage[],
+  offerTools: boolean,
+  emit: (frame: object) => void,
+  log: any
+): Promise<{ content: string; toolCalls: StreamedToolCall[]; failed: boolean }> {
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    messages,
+    stream: true,
+  };
+  if (offerTools) body.tools = [SEARCH_TOOL];
+
+  const upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: providerHeaders(provider),
+    body: JSON.stringify(body),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const detail = await upstream.text().catch(() => "");
+    log.error({ status: upstream.status, model: provider.model, detail }, "LLM provider error");
+    return { content: "", toolCalls: [], failed: true };
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let lineBuffer = "";
+  let content = "";
+  const toolCalls: Record<number, StreamedToolCall> = {};
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    lineBuffer += decoder.decode(value, { stream: true });
+    const lines = lineBuffer.split("\n");
+    lineBuffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === "[DONE]") continue;
+
+      try {
+        const json = JSON.parse(payload);
+        const delta = json.choices?.[0]?.delta;
+        if (!delta) continue;
+
+        if (typeof delta.content === "string" && delta.content) {
+          content += delta.content;
+          emit({ choices: [{ delta: { content: delta.content } }] });
+        }
+
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCalls[idx]) {
+              toolCalls[idx] = { id: tc.id ?? `call_${idx}`, name: "", arguments: "" };
+            }
+            if (tc.id) toolCalls[idx].id = tc.id;
+            if (tc.function?.name) toolCalls[idx].name += tc.function.name;
+            if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
+          }
+        }
+      } catch {
+        // ignore partial frames
+      }
+    }
+  }
+
+  return { content, toolCalls: Object.values(toolCalls), failed: false };
+}
 
 app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   const user = await guard(request, reply);
@@ -720,7 +872,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
 
   const facts = await loadActiveFacts(user);
 
-  let providerMessages: ChatMessage[];
+  let workingMessages: ChatMessage[];
   let conversationId: string | null = null;
 
   if (typeof body.message === "string" && body.message.trim()) {
@@ -733,7 +885,6 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
         return reply.code(404).send({ error: "Conversation not found" });
       }
       conversationId = body.conversationId;
-      // Claim legacy conversation on continued use
       if (!convSnap.data()?.uid) await convRef.update({ uid: user.uid });
     } else {
       const doc = await conversations.add({
@@ -755,10 +906,10 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
 
     const context = await loadConversationContext(conversationId);
     const systemPrompt = buildSystemPrompt(baseSystem, facts, context.systemBlocks);
-    providerMessages = [{ role: "system", content: systemPrompt }, ...context.history];
+    workingMessages = [{ role: "system", content: systemPrompt }, ...context.history];
   } else if (Array.isArray(body.messages) && body.messages.length > 0) {
     const systemPrompt = buildSystemPrompt(baseSystem, facts, []);
-    providerMessages = [
+    workingMessages = [
       { role: "system", content: systemPrompt },
       ...body.messages.filter((m) => m.role === "user" || m.role === "assistant"),
     ];
@@ -766,28 +917,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     return reply.code(400).send({ error: "Provide 'message' or 'messages'" });
   }
 
-  const upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: providerHeaders(provider),
-    body: JSON.stringify({
-      model: provider.model,
-      messages: providerMessages,
-      stream: true,
-    }),
-  });
-
-  if (!upstream.ok || !upstream.body) {
-    const detail = await upstream.text().catch(() => "");
-    request.log.error({ status: upstream.status, model: provider.model, detail }, "LLM provider error");
-    const friendly =
-      upstream.status === 429
-        ? "Model rate limit or daily quota hit. If you were using Pro, switch back to fast."
-        : upstream.status === 404
-        ? "Model name not recognized by provider. Check LLM_MODEL / PRO_MODEL env vars."
-        : "Model provider error.";
-    return reply.code(502).send({ error: friendly, status: upstream.status });
-  }
-
+  // SSE channel to the client — our own frames from here on.
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -797,38 +927,82 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     ...(conversationId ? { "X-Conversation-Id": conversationId } : {}),
   });
 
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let lineBuffer = "";
+  const emit = (frame: object) => {
+    reply.raw.write(`data: ${JSON.stringify(frame)}\n\n`);
+  };
+
   let assistantText = "";
+  let searchesUsed = 0;
 
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      reply.raw.write(value);
+    for (let round = 0; round <= MAX_SEARCH_ROUNDS; round++) {
+      const offerTools = Boolean(TAVILY_API_KEY) && round < MAX_SEARCH_ROUNDS;
+      const result = await streamOneRound(
+        provider,
+        workingMessages,
+        offerTools,
+        emit,
+        request.log
+      );
 
-      lineBuffer += decoder.decode(value, { stream: true });
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop() ?? "";
+      if (result.failed) {
+        emit({
+          choices: [
+            {
+              delta: {
+                content:
+                  assistantText.length > 0
+                    ? "\n\n*(The model hit an error while finishing this answer.)*"
+                    : "The model provider returned an error. If you were using Pro, try switching back to fast.",
+              },
+            },
+          ],
+        });
+        break;
+      }
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (payload === "[DONE]") continue;
+      assistantText += result.content;
+
+      if (result.toolCalls.length === 0) break; // final answer done
+
+      // Model asked to search: append its tool-call message, run searches,
+      // append results, and loop for the next round.
+      workingMessages.push({
+        role: "assistant",
+        content: result.content || null,
+        tool_calls: result.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function" as const,
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      });
+
+      for (const tc of result.toolCalls) {
+        let query = "";
         try {
-          const json = JSON.parse(payload);
-          const delta: string | undefined = json.choices?.[0]?.delta?.content;
-          if (delta) assistantText += delta;
+          query = String(JSON.parse(tc.arguments || "{}").query ?? "");
         } catch {
-          // ignore partial frames
+          query = "";
         }
+
+        emit({ search: { query: query || "(unspecified)" } });
+        searchesUsed++;
+
+        const results = query
+          ? await tavilySearch(query, request.log)
+          : "Invalid search arguments. Answer from your own knowledge.";
+
+        workingMessages.push({
+          role: "tool",
+          content: results,
+          tool_call_id: tc.id,
+        });
       }
     }
   } catch (err) {
-    request.log.error(err, "stream interrupted");
+    request.log.error(err, "chat loop failed");
   } finally {
+    reply.raw.write("data: [DONE]\n\n");
     reply.raw.end();
   }
 
@@ -849,7 +1023,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   }
 
   request.log.info(
-    { user: user.email, conversationId, model: provider.model },
+    { user: user.email, conversationId, model: provider.model, searches: searchesUsed },
     "chat completed"
   );
 });
