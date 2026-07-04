@@ -159,6 +159,10 @@ async function guard(request: any, reply: any): Promise<AuthedUser | null> {
   try {
     return await requireAllowedUser(request.headers.authorization);
   } catch (err: any) {
+    request.log.warn(
+      { attemptedEmail: err.attemptedEmail ?? "unknown", reason: err.message },
+      "auth rejected"
+    );
     reply.code(err.statusCode ?? 401).send({ error: err.message });
     return null;
   }
