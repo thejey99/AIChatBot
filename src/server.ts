@@ -572,9 +572,15 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   if (!upstream.ok || !upstream.body) {
     const detail = await upstream.text().catch(() => "");
     request.log.error({ status: upstream.status, detail }, "LLM provider error");
+    const friendly =
+      upstream.status === 429
+        ? "Model rate limit or daily quota hit. If you were using Pro, switch back to fast."
+        : upstream.status === 404
+        ? "Model name not recognized by provider. Check LLM_MODEL / LLM_PRO_MODEL env vars."
+        : "Model provider error.";
     return reply
       .code(502)
-      .send({ error: "Model provider error", status: upstream.status });
+      .send({ error: friendly, status: upstream.status });
   }
 
   reply.raw.writeHead(200, {
