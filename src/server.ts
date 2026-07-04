@@ -195,7 +195,6 @@ function ownsDoc(
 
 // ---------- Types ----------
 
-// Loose message type: also carries tool-calling fields when present.
 interface ChatMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string | null;
@@ -226,6 +225,11 @@ interface MemoryFact {
 interface ConversationContext {
   systemBlocks: string[];
   history: ChatMessage[];
+}
+
+interface SearchSource {
+  title: string;
+  url: string;
 }
 
 // ---------- Firestore helpers ----------
@@ -358,7 +362,10 @@ const SEARCH_TOOL = {
   },
 };
 
-async function tavilySearch(query: string, log: any): Promise<string> {
+async function tavilySearch(
+  query: string,
+  log: any
+): Promise<{ text: string; sources: SearchSource[] }> {
   try {
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
@@ -377,19 +384,32 @@ async function tavilySearch(query: string, log: any): Promise<string> {
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
       log.error({ status: res.status, detail: detail.slice(0, 200) }, "Tavily error");
-      return `Search failed (${res.status}). Answer from your own knowledge and say you could not verify current information.`;
+      return {
+        text: `Search failed (${res.status}). Answer from your own knowledge and say you could not verify current information.`,
+        sources: [],
+      };
     }
 
     const json = await res.json();
     const parts: string[] = [];
+    const sources: SearchSource[] = [];
+
     if (json.answer) parts.push(`Summary: ${json.answer}`);
     for (const r of json.results ?? []) {
       parts.push(`- ${r.title} (${r.url})\n  ${String(r.content ?? "").slice(0, 400)}`);
+      if (r.url) sources.push({ title: String(r.title ?? r.url), url: String(r.url) });
     }
-    return parts.length > 0 ? parts.join("\n") : "No results found.";
+
+    return {
+      text: parts.length > 0 ? parts.join("\n") : "No results found.",
+      sources,
+    };
   } catch (err) {
     log.error(err, "Tavily request failed");
-    return "Search failed. Answer from your own knowledge and say you could not verify current information.";
+    return {
+      text: "Search failed. Answer from your own knowledge and say you could not verify current information.",
+      sources: [],
+    };
   }
 }
 
@@ -553,6 +573,7 @@ app.get<{ Params: { id: string } }>(
     return snap.docs.map((d) => ({
       role: d.data().role,
       content: d.data().content,
+      sources: d.data().sources ?? null,
       createdAt: tsToMillis(d.data().createdAt),
     }));
   }
@@ -772,7 +793,7 @@ app.post<{ Params: { id: string } }>(
   }
 );
 
-// ---------- Route: chat (with tool-calling search loop) ----------
+// ---------- Route: chat (tool-calling search loop + citations) ----------
 
 interface StreamedToolCall {
   id: string;
@@ -780,11 +801,6 @@ interface StreamedToolCall {
   arguments: string;
 }
 
-/**
- * Run one streaming completion. Content deltas are emitted to the client
- * via emit(); tool calls are accumulated and returned. Returns the full
- * content text and any tool calls the model made.
- */
 async function streamOneRound(
   provider: ProviderConfig,
   messages: ChatMessage[],
@@ -917,7 +933,6 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     return reply.code(400).send({ error: "Provide 'message' or 'messages'" });
   }
 
-  // SSE channel to the client — our own frames from here on.
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -933,6 +948,8 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
 
   let assistantText = "";
   let searchesUsed = 0;
+  const collectedSources: SearchSource[] = [];
+  const seenUrls = new Set<string>();
 
   try {
     for (let round = 0; round <= MAX_SEARCH_ROUNDS; round++) {
@@ -963,10 +980,8 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
 
       assistantText += result.content;
 
-      if (result.toolCalls.length === 0) break; // final answer done
+      if (result.toolCalls.length === 0) break;
 
-      // Model asked to search: append its tool-call message, run searches,
-      // append results, and loop for the next round.
       workingMessages.push({
         role: "assistant",
         content: result.content || null,
@@ -988,13 +1003,21 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
         emit({ search: { query: query || "(unspecified)" } });
         searchesUsed++;
 
-        const results = query
-          ? await tavilySearch(query, request.log)
-          : "Invalid search arguments. Answer from your own knowledge.";
+        let toolText = "Invalid search arguments. Answer from your own knowledge.";
+        if (query) {
+          const { text, sources } = await tavilySearch(query, request.log);
+          toolText = text;
+          for (const s of sources) {
+            if (!seenUrls.has(s.url)) {
+              seenUrls.add(s.url);
+              collectedSources.push(s);
+            }
+          }
+        }
 
         workingMessages.push({
           role: "tool",
-          content: results,
+          content: toolText,
           tool_call_id: tc.id,
         });
       }
@@ -1002,6 +1025,9 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
   } catch (err) {
     request.log.error(err, "chat loop failed");
   } finally {
+    if (collectedSources.length > 0) {
+      emit({ sources: collectedSources });
+    }
     reply.raw.write("data: [DONE]\n\n");
     reply.raw.end();
   }
@@ -1011,6 +1037,7 @@ app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
     await convRef.collection("messages").add({
       role: "assistant",
       content: assistantText,
+      ...(collectedSources.length > 0 ? { sources: collectedSources } : {}),
       createdAt: FieldValue.serverTimestamp(),
     });
     await convRef.update({ updatedAt: FieldValue.serverTimestamp() });
