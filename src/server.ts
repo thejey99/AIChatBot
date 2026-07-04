@@ -142,13 +142,17 @@ async function requireAllowedUser(authHeader: string | undefined): Promise<Authe
     });
 
   const email = decoded.email?.toLowerCase();
-  if (!email || !decoded.email_verified) {
-    throw { statusCode: 403, message: "Email not verified" };
+if (!email || !decoded.email_verified) {
+    throw { statusCode: 403, message: "Email not verified", attemptedEmail: email };
   }
 
   const entry = await allowlist.doc(email).get();
   if (!entry.exists) {
-    throw { statusCode: 403, message: "This account is not authorized. Ask an admin to add you." };
+    throw {
+      statusCode: 403,
+      message: "This account is not authorized. Ask an admin to add you.",
+      attemptedEmail: email,
+    };
   }
 
   const role = (entry.data()?.role as "admin" | "user") ?? "user";
