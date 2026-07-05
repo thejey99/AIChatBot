@@ -235,6 +235,7 @@ interface MemoryFact {
   active: boolean;
   createdAt: number | null;
   sourceConversationId: string | null;
+  embedding?: number[];
 }
 
 interface ConversationContext {
@@ -247,7 +248,7 @@ interface SearchSource {
   url: string;
 }
 
-// ---------- Firestore helpers ----------
+// ---------- Firestore & RAG Helpers ----------
 
 function tsToMillis(v: unknown): number | null {
   return v instanceof Timestamp ? v.toMillis() : null;
@@ -275,8 +276,6 @@ async function loadConversationContext(
     const text = String(d.data().content ?? "");
     const image = d.data().image as string | undefined;
 
-    // Messages with an attached image become multipart content so the
-    // model can keep seeing the image in follow-up turns.
     if (image && role === "user") {
       const parts: ContentPart[] = [];
       if (text) parts.push({ type: "text", text });
@@ -307,9 +306,57 @@ async function loadActiveFacts(user: AuthedUser): Promise<MemoryFact[]> {
       active: true,
       createdAt: tsToMillis(d.data().createdAt),
       sourceConversationId: d.data().sourceConversationId ?? null,
+      embedding: d.data().embedding ?? [],
     }));
   facts.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
   return facts;
+}
+
+async function getEmbedding(text: string): Promise<number[]> {
+  try {
+    const res = await fetch(DEFAULT_PROVIDER.baseUrl + "/embeddings", {
+      method: "POST",
+      headers: providerHeaders(DEFAULT_PROVIDER),
+      body: JSON.stringify({
+        model: "text-embedding-3-small", 
+        input: text,
+      }),
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    return json.data?.[0]?.embedding || [];
+  } catch {
+    return []; // Fallback gracefully if provider lacks an embedding endpoint
+  }
+}
+
+function cosineSimilarity(vecA: number[], vecB: number[]) {
+  if (!vecA?.length || !vecB?.length || vecA.length !== vecB.length) return 0;
+  let dotProduct = 0, normA = 0, normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+async function getRelevantFacts(user: AuthedUser, queryText: string): Promise<MemoryFact[]> {
+  const allFacts = await loadActiveFacts(user);
+  if (allFacts.length === 0 || !queryText) return allFacts.slice(-10); // fallback latest 10
+
+  const queryEmbedding = await getEmbedding(queryText);
+  if (queryEmbedding.length === 0) return allFacts.slice(-10); // fallback
+
+  const scored = allFacts.map(fact => ({
+    ...fact,
+    score: fact.embedding?.length ? cosineSimilarity(queryEmbedding, fact.embedding) : 0,
+  }));
+
+  // Sort by highest similarity
+  scored.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  return scored.slice(0, 5); // Return top 5 most relevant facts to save context
 }
 
 function buildSystemPrompt(
@@ -376,7 +423,7 @@ async function llmComplete(messages: ChatMessage[]): Promise<string> {
   return String(json.choices?.[0]?.message?.content ?? "");
 }
 
-// ---------- Web search (Tavily) ----------
+// ---------- Tools & Web search (Tavily) ----------
 
 const SEARCH_TOOL = {
   type: "function" as const,
@@ -395,6 +442,30 @@ const SEARCH_TOOL = {
       },
       required: ["query"],
     },
+  },
+};
+
+const FETCH_URL_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "fetch_url",
+    description: "Fetch and read the text content of a given URL. Useful for reading articles, documentation, or links provided by the user.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The full URL to fetch (e.g., https://example.com)" },
+      },
+      required: ["url"],
+    },
+  },
+};
+
+const TIME_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "get_current_time",
+    description: "Get the exact current date and time.",
+    parameters: { type: "object", properties: {} },
   },
 };
 
@@ -694,12 +765,15 @@ app.post<{ Body: { text?: string } }>("/api/memory", async (request, reply) => {
   const text = request.body?.text?.trim();
   if (!text) return reply.code(400).send({ error: "text required" });
 
+  const embedding = await getEmbedding(text);
+
   const doc = await memory.add({
     uid: user.uid,
     text,
     active: true,
     createdAt: FieldValue.serverTimestamp(),
     sourceConversationId: null,
+    embedding,
   });
   return { id: doc.id };
 });
@@ -719,6 +793,7 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
     const updates: Record<string, unknown> = {};
     if (typeof request.body?.text === "string" && request.body.text.trim()) {
       updates.text = request.body.text.trim();
+      updates.embedding = await getEmbedding(updates.text as string); // Update embedding when text changes
     }
     if (typeof request.body?.active === "boolean") {
       updates.active = request.body.active;
@@ -755,6 +830,3 @@ function parseExtraction(raw: string): ExtractionResult | null {
   const cleaned = raw
     .trim()
     .replace(/^
-http://googleusercontent.com/immersive_entry_chip/0
-
-*(Note: Since this now happens in the background, you can safely remove the "Remember" button from your frontend `App.tsx` file whenever you are ready!)*
