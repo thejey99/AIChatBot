@@ -827,6 +827,13 @@ interface ExtractionResult {
 }
 
 function parseExtraction(raw: string): ExtractionResult | null {
-  const cleaned = raw
-    .trim()
-    .replace()}
+  try {
+    // Strip out markdown code fences if the LLM accidentally includes them
+    const cleaned = raw
+      .trim()
+      .replace(/^
+http://googleusercontent.com/immersive_entry_chip/0
+
+### Why this works:
+1. **Safely Parses JSON:** The `.replace(/^
+http://googleusercontent.com/immersive_entry_chip/1
