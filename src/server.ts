@@ -828,12 +828,31 @@ interface ExtractionResult {
 
 function parseExtraction(raw: string): ExtractionResult | null {
   try {
-    // Strip out markdown code fences if the LLM accidentally includes them
+    // Strip out markdown code fences using hex escapes (\x60) for backticks
+    // to avoid literal backticks in the source file.
     const cleaned = raw
       .trim()
-      .replace(/^
-http://googleusercontent.com/immersive_entry_chip/0
+      .replace(/^\x60\x60\x60(?:json)?\n?/i, "")
+      .replace(/\n?\x60\x60\x60$/i, "")
+      .trim();
+      
+    return JSON.parse(cleaned) as ExtractionResult;
+  } catch (err) {
+    console.error("Failed to parse extraction result. Raw LLM output:", raw);
+    return null;
+  }
+}
 
-### Why this works:
-1. **Safely Parses JSON:** The `.replace(/^
-http://googleusercontent.com/immersive_entry_chip/1
+// ---------- Server Start ----------
+
+const start = async () => {
+  try {
+    await app.listen({ port: PORT, host: "0.0.0.0" });
+    console.log("Server is up and listening on port " + PORT);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
+
+start();
