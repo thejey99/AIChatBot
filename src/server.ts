@@ -44,6 +44,11 @@ const MAX_IMAGE_BYTES = 900_000;
 // never contains literal backticks (they corrupt when shared via markdown).
 const FENCE_HINT = String.fromCharCode(96, 96, 96);
 
+// Automatic memory sweep: a conversation qualifies when idle this long AND
+// has new activity since its last extraction watermark.
+const MEMORY_IDLE_MS = 30 * 60 * 1000;
+const SWEEP_LIMIT = 2; // max extractions per sweep, bounds cost + latency
+
 interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
@@ -235,7 +240,6 @@ interface MemoryFact {
   active: boolean;
   createdAt: number | null;
   sourceConversationId: string | null;
-  embedding?: number[];
 }
 
 interface ConversationContext {
@@ -248,7 +252,7 @@ interface SearchSource {
   url: string;
 }
 
-// ---------- Firestore & RAG Helpers ----------
+// ---------- Firestore helpers ----------
 
 function tsToMillis(v: unknown): number | null {
   return v instanceof Timestamp ? v.toMillis() : null;
@@ -276,6 +280,8 @@ async function loadConversationContext(
     const text = String(d.data().content ?? "");
     const image = d.data().image as string | undefined;
 
+    // Messages with an attached image become multipart content so the
+    // model can keep seeing the image in follow-up turns.
     if (image && role === "user") {
       const parts: ContentPart[] = [];
       if (text) parts.push({ type: "text", text });
@@ -306,57 +312,9 @@ async function loadActiveFacts(user: AuthedUser): Promise<MemoryFact[]> {
       active: true,
       createdAt: tsToMillis(d.data().createdAt),
       sourceConversationId: d.data().sourceConversationId ?? null,
-      embedding: d.data().embedding ?? [],
     }));
   facts.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
   return facts;
-}
-
-async function getEmbedding(text: string): Promise<number[]> {
-  try {
-    const res = await fetch(DEFAULT_PROVIDER.baseUrl + "/embeddings", {
-      method: "POST",
-      headers: providerHeaders(DEFAULT_PROVIDER),
-      body: JSON.stringify({
-        model: "text-embedding-3-small", 
-        input: text,
-      }),
-    });
-    if (!res.ok) return [];
-    const json = await res.json();
-    return json.data?.[0]?.embedding || [];
-  } catch {
-    return []; // Fallback gracefully if provider lacks an embedding endpoint
-  }
-}
-
-function cosineSimilarity(vecA: number[], vecB: number[]) {
-  if (!vecA?.length || !vecB?.length || vecA.length !== vecB.length) return 0;
-  let dotProduct = 0, normA = 0, normB = 0;
-  for (let i = 0; i < vecA.length; i++) {
-    dotProduct += vecA[i] * vecB[i];
-    normA += vecA[i] * vecA[i];
-    normB += vecB[i] * vecB[i];
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-async function getRelevantFacts(user: AuthedUser, queryText: string): Promise<MemoryFact[]> {
-  const allFacts = await loadActiveFacts(user);
-  if (allFacts.length === 0 || !queryText) return allFacts.slice(-10); // fallback latest 10
-
-  const queryEmbedding = await getEmbedding(queryText);
-  if (queryEmbedding.length === 0) return allFacts.slice(-10); // fallback
-
-  const scored = allFacts.map(fact => ({
-    ...fact,
-    score: fact.embedding?.length ? cosineSimilarity(queryEmbedding, fact.embedding) : 0,
-  }));
-
-  // Sort by highest similarity
-  scored.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  return scored.slice(0, 5); // Return top 5 most relevant facts to save context
 }
 
 function buildSystemPrompt(
@@ -423,7 +381,7 @@ async function llmComplete(messages: ChatMessage[]): Promise<string> {
   return String(json.choices?.[0]?.message?.content ?? "");
 }
 
-// ---------- Tools & Web search (Tavily) ----------
+// ---------- Web search (Tavily) ----------
 
 const SEARCH_TOOL = {
   type: "function" as const,
@@ -442,30 +400,6 @@ const SEARCH_TOOL = {
       },
       required: ["query"],
     },
-  },
-};
-
-const FETCH_URL_TOOL = {
-  type: "function" as const,
-  function: {
-    name: "fetch_url",
-    description: "Fetch and read the text content of a given URL. Useful for reading articles, documentation, or links provided by the user.",
-    parameters: {
-      type: "object",
-      properties: {
-        url: { type: "string", description: "The full URL to fetch (e.g., https://example.com)" },
-      },
-      required: ["url"],
-    },
-  },
-};
-
-const TIME_TOOL = {
-  type: "function" as const,
-  function: {
-    name: "get_current_time",
-    description: "Get the exact current date and time.",
-    parameters: { type: "object", properties: {} },
   },
 };
 
@@ -586,6 +520,147 @@ async function maybeCompact(conversationId: string, log: any): Promise<void> {
   });
 
   log.info({ conversationId, folded: toFold.length }, "conversation compacted");
+}
+
+// ---------- Memory extraction (shared by button + auto-sweep) ----------
+
+const EXTRACTION_INSTRUCTIONS =
+  "You maintain a long-term memory of durable facts about the user.\n\n" +
+  "Given the conversation transcript and the list of EXISTING facts, respond with ONLY a JSON object, no markdown fences, in exactly this shape:\n" +
+  '{"new_facts": ["..."], "deactivate_ids": ["..."]}\n\n' +
+  "Rules:\n" +
+  '- new_facts: durable facts about the user worth remembering across future conversations (preferences, projects, people, decisions, circumstances). Write each as one short standalone sentence about "the user".\n' +
+  "- Do NOT include facts already covered by an existing fact.\n" +
+  "- Do NOT include trivia, small talk, or one-off details with no future value.\n" +
+  "- deactivate_ids: IDs of existing facts that this conversation shows are now false, outdated, or superseded.\n" +
+  '- If nothing qualifies, return {"new_facts": [], "deactivate_ids": []}.';
+
+interface ExtractionResult {
+  new_facts: string[];
+  deactivate_ids: string[];
+}
+
+function parseExtraction(raw: string): ExtractionResult | null {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  try {
+    const json = JSON.parse(cleaned);
+    if (!Array.isArray(json.new_facts) || !Array.isArray(json.deactivate_ids)) return null;
+    return {
+      new_facts: json.new_facts.filter((f: unknown) => typeof f === "string" && f.trim()),
+      deactivate_ids: json.deactivate_ids.filter((i: unknown) => typeof i === "string"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run memory extraction for one conversation, on behalf of its owner.
+ * Stamps memoryExtractedAt so the sweep never re-processes an unchanged
+ * conversation. Returns null on failure (harmless; retried next sweep).
+ */
+async function extractConversationMemory(
+  user: AuthedUser,
+  conversationId: string,
+  log: any
+): Promise<{ added: string[]; deactivated: number } | null> {
+  const convRef = conversations.doc(conversationId);
+
+  const msgSnap = await convRef.collection("messages").orderBy("createdAt", "asc").get();
+  if (msgSnap.empty) return { added: [], deactivated: 0 };
+
+  const transcript = msgSnap.docs
+    .map((d) => {
+      const who = d.data().role === "user" ? "User" : "Assistant";
+      const img = d.data().image ? " [image attached]" : "";
+      return who + ":" + img + " " + d.data().content;
+    })
+    .join("\n");
+
+  const existing = await loadActiveFacts(user);
+  const existingBlock =
+    existing.length > 0
+      ? existing.map((f) => "[" + f.id + "] " + f.text).join("\n")
+      : "(none)";
+
+  const extractionMessages: ChatMessage[] = [
+    { role: "system", content: EXTRACTION_INSTRUCTIONS },
+    {
+      role: "user",
+      content: "EXISTING FACTS:\n" + existingBlock + "\n\nTRANSCRIPT:\n" + transcript,
+    },
+  ];
+
+  let result: ExtractionResult | null = null;
+  for (let attempt = 0; attempt < 2 && !result; attempt++) {
+    try {
+      const raw = await llmComplete(extractionMessages);
+      result = parseExtraction(raw);
+    } catch (err) {
+      log.error(err, "extraction call failed");
+    }
+  }
+
+  if (!result) return null;
+
+  const validIds = new Set(existing.map((f) => f.id));
+  const batch = db.batch();
+
+  let deactivated = 0;
+  for (const id of result.deactivate_ids) {
+    if (!validIds.has(id)) continue;
+    batch.update(memory.doc(id), { active: false });
+    deactivated++;
+  }
+
+  for (const text of result.new_facts) {
+    batch.set(memory.doc(), {
+      uid: user.uid,
+      text: text.trim(),
+      active: true,
+      createdAt: FieldValue.serverTimestamp(),
+      sourceConversationId: conversationId,
+    });
+  }
+
+  // Watermark: this conversation is extracted as of now
+  batch.update(convRef, { memoryExtractedAt: FieldValue.serverTimestamp() });
+
+  await batch.commit();
+
+  log.info(
+    { conversationId, added: result.new_facts.length, deactivated, user: user.email },
+    "memory extraction applied"
+  );
+
+  return { added: result.new_facts, deactivated };
+}
+
+// ---------- Automatic memory sweep ----------
+
+async function sweepIdleConversations(user: AuthedUser, log: any): Promise<void> {
+  const now = Date.now();
+  const snap = await conversations.orderBy("updatedAt", "desc").limit(100).get();
+
+  const candidates = snap.docs.filter((d) => {
+    if (!ownsDoc(user, d.data())) return false;
+    const updatedAt = tsToMillis(d.data().updatedAt);
+    if (!updatedAt) return false;
+    if (now - updatedAt < MEMORY_IDLE_MS) return false; // still active
+    const extractedAt = tsToMillis(d.data().memoryExtractedAt);
+    return !extractedAt || extractedAt < updatedAt; // new activity since last sweep
+  });
+
+  for (const doc of candidates.slice(0, SWEEP_LIMIT)) {
+    try {
+      await extractConversationMemory(user, doc.id, log);
+    } catch (err) {
+      log.error({ conversationId: doc.id, err }, "auto memory sweep failed");
+    }
+  }
 }
 
 // ---------- Routes: health & me ----------
@@ -765,15 +840,12 @@ app.post<{ Body: { text?: string } }>("/api/memory", async (request, reply) => {
   const text = request.body?.text?.trim();
   if (!text) return reply.code(400).send({ error: "text required" });
 
-  const embedding = await getEmbedding(text);
-
   const doc = await memory.add({
     uid: user.uid,
     text,
     active: true,
     createdAt: FieldValue.serverTimestamp(),
     sourceConversationId: null,
-    embedding,
   });
   return { id: doc.id };
 });
@@ -793,7 +865,6 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
     const updates: Record<string, unknown> = {};
     if (typeof request.body?.text === "string" && request.body.text.trim()) {
       updates.text = request.body.text.trim();
-      updates.embedding = await getEmbedding(updates.text as string); // Update embedding when text changes
     }
     if (typeof request.body?.active === "boolean") {
       updates.active = request.body.active;
@@ -808,51 +879,323 @@ app.patch<{ Params: { id: string }; Body: { text?: string; active?: boolean } }>
   }
 );
 
-// ---------- Extraction Logic (Auto + Manual) ----------
+// ---------- Route: manual extraction ("Remember" button) ----------
 
-const EXTRACTION_INSTRUCTIONS =
-  "You maintain a long-term memory of durable facts about the user.\n\n" +
-  "Given the conversation transcript and the list of EXISTING facts, respond with ONLY a JSON object, no markdown fences, in exactly this shape:\n" +
-  '{"new_facts": ["..."], "deactivate_ids": ["..."]}\n\n' +
-  "Rules:\n" +
-  '- new_facts: durable facts about the user worth remembering across future conversations (preferences, projects, people, decisions, circumstances). Write each as one short standalone sentence about "the user".\n' +
-  "- Do NOT include facts already covered by an existing fact.\n" +
-  "- Do NOT include trivia, small talk, or one-off details with no future value.\n" +
-  "- deactivate_ids: IDs of existing facts that this conversation shows are now false, outdated, or superseded.\n" +
-  '- If nothing qualifies, return {"new_facts": [], "deactivate_ids": []}.';
+app.post<{ Params: { id: string } }>(
+  "/api/conversations/:id/remember",
+  async (request, reply) => {
+    const user = await guard(request, reply);
+    if (!user) return;
 
-interface ExtractionResult {
-  new_facts: string[];
-  deactivate_ids: string[];
+    const conversationId = request.params.id;
+    const convRef = conversations.doc(conversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+      return reply.code(404).send({ error: "Not found" });
+    }
+
+    const result = await extractConversationMemory(user, conversationId, request.log);
+    if (!result) {
+      return reply.code(502).send({ error: "Extraction failed after retry" });
+    }
+    return result;
+  }
+);
+
+// ---------- Route: chat ----------
+
+interface StreamedToolCall {
+  id: string;
+  name: string;
+  arguments: string;
 }
 
-function parseExtraction(raw: string): ExtractionResult | null {
-  try {
-    // Strip out markdown code fences using hex escapes (\x60) for backticks
-    // to avoid literal backticks in the source file.
-    const cleaned = raw
-      .trim()
-      .replace(/^\x60\x60\x60(?:json)?\n?/i, "")
-      .replace(/\n?\x60\x60\x60$/i, "")
-      .trim();
-      
-    return JSON.parse(cleaned) as ExtractionResult;
-  } catch (err) {
-    console.error("Failed to parse extraction result. Raw LLM output:", raw);
-    return null;
+async function streamOneRound(
+  provider: ProviderConfig,
+  messages: ChatMessage[],
+  offerTools: boolean,
+  emit: (frame: object) => void,
+  log: any
+): Promise<{ content: string; toolCalls: StreamedToolCall[]; failed: boolean }> {
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    messages,
+    stream: true,
+  };
+  if (offerTools) body.tools = [SEARCH_TOOL];
+
+  const upstream = await fetch(provider.baseUrl + "/chat/completions", {
+    method: "POST",
+    headers: providerHeaders(provider),
+    body: JSON.stringify(body),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const detail = await upstream.text().catch(() => "");
+    log.error({ status: upstream.status, model: provider.model, detail }, "LLM provider error");
+    return { content: "", toolCalls: [], failed: true };
   }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let lineBuffer = "";
+  let content = "";
+  const toolCalls: Record<number, StreamedToolCall> = {};
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    lineBuffer += decoder.decode(value, { stream: true });
+    const lines = lineBuffer.split("\n");
+    lineBuffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === "[DONE]") continue;
+
+      try {
+        const json = JSON.parse(payload);
+        const delta = json.choices?.[0]?.delta;
+        if (!delta) continue;
+
+        if (typeof delta.content === "string" && delta.content) {
+          content += delta.content;
+          emit({ choices: [{ delta: { content: delta.content } }] });
+        }
+
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCalls[idx]) {
+              toolCalls[idx] = { id: tc.id ?? "call_" + idx, name: "", arguments: "" };
+            }
+            if (tc.id) toolCalls[idx].id = tc.id;
+            if (tc.function?.name) toolCalls[idx].name += tc.function.name;
+            if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
+          }
+        }
+      } catch {
+        // ignore partial frames
+      }
+    }
+  }
+
+  return { content, toolCalls: Object.values(toolCalls), failed: false };
 }
 
-// ---------- Server Start ----------
+app.post<{ Body: ChatBody }>("/api/chat", async (request, reply) => {
+  const user = await guard(request, reply);
+  if (!user) return;
 
-const start = async () => {
-  try {
-    await app.listen({ port: PORT, host: "0.0.0.0" });
-    console.log("Server is up and listening on port " + PORT);
-  } catch (err) {
-    app.log.error(err);
-    process.exit(1);
+  const body = request.body ?? {};
+  const baseSystem =
+    body.system ?? "You are a helpful personal assistant. Be concise and direct.";
+
+  // Validate image payload if present
+  let image: string | undefined;
+  if (typeof body.image === "string" && body.image) {
+    if (!body.image.startsWith("data:image/")) {
+      return reply.code(400).send({ error: "image must be a data:image/* URL" });
+    }
+    if (body.image.length > MAX_IMAGE_BYTES) {
+      return reply.code(400).send({ error: "Image too large (max ~900KB after compression)" });
+    }
+    image = body.image;
   }
-};
 
-start();
+  // Images force the multimodal default lane; PRO (Groq) is text-only.
+  const provider = image
+    ? DEFAULT_PROVIDER
+    : MODEL_ALIASES[body.model ?? "default"] ?? DEFAULT_PROVIDER;
+
+  const facts = await loadActiveFacts(user);
+
+  let workingMessages: ChatMessage[];
+  let conversationId: string | null = null;
+
+  if (typeof body.message === "string" && (body.message.trim() || image)) {
+    const userText = body.message.trim();
+
+    if (body.conversationId) {
+      const convRef = conversations.doc(body.conversationId);
+      const convSnap = await convRef.get();
+      if (!convSnap.exists || !ownsDoc(user, convSnap.data())) {
+        return reply.code(404).send({ error: "Conversation not found" });
+      }
+      conversationId = body.conversationId;
+      if (!convSnap.data()?.uid) await convRef.update({ uid: user.uid });
+    } else {
+      const doc = await conversations.add({
+        uid: user.uid,
+        title: (userText || "Image").slice(0, 60),
+        pinned: false,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      conversationId = doc.id;
+    }
+
+    const convRef = conversations.doc(conversationId);
+    await convRef.collection("messages").add({
+      role: "user",
+      content: userText,
+      ...(image ? { image } : {}),
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    const context = await loadConversationContext(conversationId);
+    const systemPrompt = buildSystemPrompt(baseSystem, facts, context.systemBlocks);
+    workingMessages = [{ role: "system", content: systemPrompt }, ...context.history];
+  } else if (Array.isArray(body.messages) && body.messages.length > 0) {
+    const systemPrompt = buildSystemPrompt(baseSystem, facts, []);
+    workingMessages = [
+      { role: "system", content: systemPrompt },
+      ...body.messages.filter((m) => m.role === "user" || m.role === "assistant"),
+    ];
+  } else {
+    return reply.code(400).send({ error: "Provide 'message' or 'messages'" });
+  }
+
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+    "Access-Control-Expose-Headers": "X-Conversation-Id",
+    ...(conversationId ? { "X-Conversation-Id": conversationId } : {}),
+  });
+
+  const emit = (frame: object) => {
+    reply.raw.write("data: " + JSON.stringify(frame) + "\n\n");
+  };
+
+  let assistantText = "";
+  let searchesUsed = 0;
+  const collectedSources: SearchSource[] = [];
+  const seenUrls = new Set<string>();
+
+  try {
+    for (let round = 0; round <= MAX_SEARCH_ROUNDS; round++) {
+      const offerTools = Boolean(TAVILY_API_KEY) && round < MAX_SEARCH_ROUNDS;
+      const result = await streamOneRound(
+        provider,
+        workingMessages,
+        offerTools,
+        emit,
+        request.log
+      );
+
+      if (result.failed) {
+        emit({
+          choices: [
+            {
+              delta: {
+                content:
+                  assistantText.length > 0
+                    ? "\n\n*(The model hit an error while finishing this answer.)*"
+                    : "The model provider returned an error. If you were using Pro, try switching back to fast.",
+              },
+            },
+          ],
+        });
+        break;
+      }
+
+      assistantText += result.content;
+
+      if (result.toolCalls.length === 0) break;
+
+      workingMessages.push({
+        role: "assistant",
+        content: result.content || null,
+        tool_calls: result.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function" as const,
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      });
+
+      for (const tc of result.toolCalls) {
+        let query = "";
+        try {
+          query = String(JSON.parse(tc.arguments || "{}").query ?? "");
+        } catch {
+          query = "";
+        }
+
+        emit({ search: { query: query || "(unspecified)" } });
+        searchesUsed++;
+
+        let toolText = "Invalid search arguments. Answer from your own knowledge.";
+        if (query) {
+          const { text, sources } = await tavilySearch(query, request.log);
+          toolText = text;
+          for (const s of sources) {
+            if (!seenUrls.has(s.url)) {
+              seenUrls.add(s.url);
+              collectedSources.push(s);
+            }
+          }
+        }
+
+        workingMessages.push({
+          role: "tool",
+          content: toolText,
+          tool_call_id: tc.id,
+        });
+      }
+    }
+  } catch (err) {
+    request.log.error(err, "chat loop failed");
+  } finally {
+    if (collectedSources.length > 0) {
+      emit({ sources: collectedSources });
+    }
+    reply.raw.write("data: [DONE]\n\n");
+    reply.raw.end();
+  }
+
+  if (conversationId && assistantText) {
+    const convRef = conversations.doc(conversationId);
+    await convRef.collection("messages").add({
+      role: "assistant",
+      content: assistantText,
+      ...(collectedSources.length > 0 ? { sources: collectedSources } : {}),
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    await convRef.update({ updatedAt: FieldValue.serverTimestamp() });
+
+    try {
+      await maybeCompact(conversationId, request.log);
+    } catch (err) {
+      request.log.error(err, "compaction failed (will retry next turn)");
+    }
+
+    try {
+      await sweepIdleConversations(user, request.log);
+    } catch (err) {
+      request.log.error(err, "memory sweep failed (will retry next request)");
+    }
+  }
+
+  request.log.info(
+    {
+      user: user.email,
+      conversationId,
+      model: provider.model,
+      searches: searchesUsed,
+      hasImage: Boolean(image),
+    },
+    "chat completed"
+  );
+});
+
+// ---------- Start ----------
+
+app.listen({ port: PORT, host: "0.0.0.0" }).catch((err) => {
+  app.log.error(err);
+  process.exit(1);
+});
