@@ -829,4 +829,4 @@ interface ExtractionResult {
 function parseExtraction(raw: string): ExtractionResult | null {
   const cleaned = raw
     .trim()
-    .replace(/^)
+    .replace()
